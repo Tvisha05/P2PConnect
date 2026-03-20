@@ -1,0 +1,381 @@
+import { prisma } from "@/lib/prisma";
+
+const MAX_GROUP_SIZE = 5;
+const MIN_GROUP_SIZE = 2;
+const PROPOSAL_EXPIRY_MINUTES = 5;
+
+// ─── Types ──────────────────────────────────────────────
+
+type PoolEntry = {
+  id: string; // waitingPool record id
+  userId: string;
+  doubtId: string;
+  subject: string; // lowercase
+};
+
+type Graph = Map<string, string[]>; // userId → [userIds they can help]
+
+// ─── Graph Building ─────────────────────────────────────
+
+/**
+ * Build directed graph: edge from A → B means A has a strong subject
+ * that matches B's doubt subject (A can help B).
+ */
+async function buildGraph(pool: PoolEntry[]): Promise<Graph> {
+  const graph: Graph = new Map();
+  const userIds = [...new Set(pool.map((p) => p.userId))];
+
+  // Fetch strong subjects for all users in pool
+  const profiles = await prisma.academicProfile.findMany({
+    where: { userId: { in: userIds } },
+    include: { subjectAffinities: true },
+  });
+
+  // Map userId → set of strong subjects (lowercase)
+  const strongMap = new Map<string, Set<string>>();
+  for (const profile of profiles) {
+    const subjects = new Set(
+      profile.subjectAffinities.map((a) => a.subject.toLowerCase())
+    );
+    strongMap.set(profile.userId, subjects);
+  }
+
+  // Also fetch strong subjects from ALL users (not just pool) who could help
+  const allHelpers = await prisma.academicProfile.findMany({
+    where: {
+      subjectAffinities: {
+        some: {
+          subject: {
+            in: pool.map((p) => p.subject),
+            mode: "insensitive",
+          },
+        },
+      },
+    },
+    include: { subjectAffinities: true },
+  });
+
+  for (const helper of allHelpers) {
+    if (!strongMap.has(helper.userId)) {
+      const subjects = new Set(
+        helper.subjectAffinities.map((a) => a.subject.toLowerCase())
+      );
+      strongMap.set(helper.userId, subjects);
+    }
+  }
+
+  // Build edges: for each pool entry, find who can help (strong in their doubt subject)
+  // Edge: helper → learner (helper has strong subject matching learner's doubt)
+  for (const entry of pool) {
+    const learnerId = entry.userId;
+    const doubtSubject = entry.subject.toLowerCase();
+
+    for (const [helperId, strongSubjects] of strongMap) {
+      if (helperId === learnerId) continue;
+      if (strongSubjects.has(doubtSubject)) {
+        const existing = graph.get(helperId) || [];
+        if (!existing.includes(learnerId)) {
+          existing.push(learnerId);
+          graph.set(helperId, existing);
+        }
+      }
+    }
+  }
+
+  return graph;
+}
+
+// ─── Cycle Detection ────────────────────────────────────
+
+/**
+ * Find a mutual-benefit cycle of given size in the pool.
+ * A cycle means: A helps B, B helps C, ..., N helps A.
+ * Each member must be in the pool (have an active doubt).
+ */
+function findCycleOfSize(
+  graph: Graph,
+  poolUserIds: Set<string>,
+  size: number
+): string[] | null {
+  const users = [...poolUserIds];
+  if (users.length < size) return null;
+
+  // Generate combinations of `size` users from pool
+  const combos = combinations(users, size);
+
+  for (const combo of combos) {
+    // Try all permutations to find a valid cycle
+    const perms = permutations(combo);
+    for (const perm of perms) {
+      let valid = true;
+      for (let i = 0; i < size; i++) {
+        const curr = perm[i];
+        const next = perm[(i + 1) % size];
+        const neighbors = graph.get(curr) || [];
+        if (!neighbors.includes(next)) {
+          valid = false;
+          break;
+        }
+      }
+      if (valid) return perm;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Try to form cycle groups, largest first (5 → 4 → 3 → 2).
+ */
+function tryCycleGroups(
+  graph: Graph,
+  poolUserIds: Set<string>
+): string[] | null {
+  const maxSize = Math.min(MAX_GROUP_SIZE, poolUserIds.size);
+  for (let size = maxSize; size >= MIN_GROUP_SIZE; size--) {
+    const cycle = findCycleOfSize(graph, poolUserIds, size);
+    if (cycle) return cycle;
+  }
+  return null;
+}
+
+// ─── One-Way Helper Groups ──────────────────────────────
+
+/**
+ * Find a one-way helper group: one helper who can help multiple learners.
+ * Returns { helperId, learnerIds } or null.
+ */
+function tryOneWayGroup(
+  graph: Graph,
+  poolUserIds: Set<string>
+): { helperId: string; learnerIds: string[] } | null {
+  // Try helpers with the most learners first
+  const candidates: { helperId: string; learnerIds: string[] }[] = [];
+
+  for (const [helperId, neighbors] of graph) {
+    const learners = neighbors.filter((id) => poolUserIds.has(id));
+    if (learners.length > 0) {
+      candidates.push({ helperId, learnerIds: learners });
+    }
+  }
+
+  // Sort by number of learners (descending) — prefer larger groups
+  candidates.sort((a, b) => b.learnerIds.length - a.learnerIds.length);
+
+  return candidates[0] || null;
+}
+
+// ─── Main Matching Logic ────────────────────────────────
+
+/**
+ * Run the matching engine. Called whenever a new doubt is posted.
+ * Creates MatchProposals for helpers to accept/reject.
+ */
+export async function triggerMatching(): Promise<void> {
+  // Fetch current waiting pool
+  const poolEntries = await prisma.waitingPool.findMany({
+    orderBy: { joinedAt: "asc" },
+  });
+
+  if (poolEntries.length < MIN_GROUP_SIZE) return;
+
+  const pool: PoolEntry[] = poolEntries.map((e) => ({
+    id: e.id,
+    userId: e.userId,
+    doubtId: e.doubtId,
+    subject: e.subject,
+  }));
+
+  // Don't match users who already have pending proposals
+  const pendingProposals = await prisma.matchProposal.findMany({
+    where: { status: "PENDING" },
+    select: { members: true },
+  });
+  const pendingUserIds = new Set(pendingProposals.flatMap((p) => p.members));
+  const availablePool = pool.filter((p) => !pendingUserIds.has(p.userId));
+
+  if (availablePool.length < MIN_GROUP_SIZE) return;
+
+  const graph = await buildGraph(availablePool);
+  const poolUserIds = new Set(availablePool.map((p) => p.userId));
+
+  const expiresAt = new Date(Date.now() + PROPOSAL_EXPIRY_MINUTES * 60 * 1000);
+
+  // Step 1: Try cycle groups
+  const cycle = tryCycleGroups(graph, poolUserIds);
+  if (cycle) {
+    // In a cycle, everyone is both helper and learner — auto-form the group
+    const memberDoubtIds = cycle.map((userId) => {
+      const entry = availablePool.find((p) => p.userId === userId);
+      return entry!.doubtId;
+    });
+    const subjects = [
+      ...new Set(
+        cycle.map((userId) => {
+          const entry = availablePool.find((p) => p.userId === userId);
+          return entry!.subject;
+        })
+      ),
+    ];
+
+    // Cycle groups are auto-accepted (everyone benefits mutually)
+    await prisma.$transaction(async (tx) => {
+      const group = await tx.matchGroup.create({
+        data: {
+          type: "cycle",
+          subjects,
+          members: {
+            create: cycle.map((userId, i) => ({
+              userId,
+              doubtId: memberDoubtIds[i],
+              role: "helper", // everyone is both
+            })),
+          },
+        },
+      });
+
+      // Remove matched users from pool
+      await tx.waitingPool.deleteMany({
+        where: { userId: { in: cycle } },
+      });
+
+      return group;
+    });
+
+    // Recursively try more matches with remaining pool
+    return triggerMatching();
+  }
+
+  // Step 2: Try one-way helper groups
+  const oneWay = tryOneWayGroup(graph, poolUserIds);
+  if (oneWay) {
+    const { helperId, learnerIds } = oneWay;
+    const allMembers = [helperId, ...learnerIds];
+    const doubtIds = learnerIds.map((id) => {
+      const entry = availablePool.find((p) => p.userId === id);
+      return entry!.doubtId;
+    });
+    const subjects = [
+      ...new Set(
+        learnerIds.map((id) => {
+          const entry = availablePool.find((p) => p.userId === id);
+          return entry!.subject;
+        })
+      ),
+    ];
+
+    // Create proposal — only helper needs to confirm
+    await prisma.matchProposal.create({
+      data: {
+        type: "one_way",
+        status: "PENDING",
+        members: allMembers,
+        doubtIds,
+        subjects,
+        helperId,
+        expiresAt,
+      },
+    });
+  }
+}
+
+// ─── Proposal Actions ───────────────────────────────────
+
+export async function acceptProposal(proposalId: string, helperId: string) {
+  const proposal = await prisma.matchProposal.findUnique({
+    where: { id: proposalId },
+  });
+
+  if (!proposal || proposal.status !== "PENDING") {
+    throw new Error("Proposal not found or already handled");
+  }
+  if (proposal.helperId !== helperId) {
+    throw new Error("Only the assigned helper can accept");
+  }
+
+  return prisma.$transaction(async (tx) => {
+    // Update proposal status
+    await tx.matchProposal.update({
+      where: { id: proposalId },
+      data: { status: "ACCEPTED" },
+    });
+
+    // Create the match group
+    const learnerIds = proposal.members.filter((id) => id !== helperId);
+    const group = await tx.matchGroup.create({
+      data: {
+        type: "one_way",
+        subjects: proposal.subjects,
+        members: {
+          create: [
+            { userId: helperId, role: "helper" },
+            ...learnerIds.map((userId, i) => ({
+              userId,
+              doubtId: proposal.doubtIds[i] || null,
+              role: "learner" as const,
+            })),
+          ],
+        },
+      },
+      include: { members: true },
+    });
+
+    // Remove learners from waiting pool (helper stays for future matches)
+    await tx.waitingPool.deleteMany({
+      where: { userId: { in: learnerIds } },
+    });
+
+    return group;
+  });
+}
+
+export async function rejectProposal(proposalId: string, helperId: string) {
+  const proposal = await prisma.matchProposal.findUnique({
+    where: { id: proposalId },
+  });
+
+  if (!proposal || proposal.status !== "PENDING") {
+    throw new Error("Proposal not found or already handled");
+  }
+  if (proposal.helperId !== helperId) {
+    throw new Error("Only the assigned helper can reject");
+  }
+
+  await prisma.matchProposal.update({
+    where: { id: proposalId },
+    data: { status: "REJECTED" },
+  });
+
+  // Everyone stays in pool — try matching again
+  await triggerMatching();
+}
+
+// ─── Utility: Combinations & Permutations ───────────────
+
+function combinations<T>(arr: T[], size: number): T[][] {
+  if (size === 0) return [[]];
+  if (arr.length < size) return [];
+
+  const result: T[][] = [];
+  for (let i = 0; i <= arr.length - size; i++) {
+    const rest = combinations(arr.slice(i + 1), size - 1);
+    for (const combo of rest) {
+      result.push([arr[i], ...combo]);
+    }
+  }
+  return result;
+}
+
+function permutations<T>(arr: T[]): T[][] {
+  if (arr.length <= 1) return [arr];
+
+  const result: T[][] = [];
+  for (let i = 0; i < arr.length; i++) {
+    const rest = [...arr.slice(0, i), ...arr.slice(i + 1)];
+    const perms = permutations(rest);
+    for (const perm of perms) {
+      result.push([arr[i], ...perm]);
+    }
+  }
+  return result;
+}
