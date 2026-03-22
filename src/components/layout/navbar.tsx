@@ -5,6 +5,7 @@ import { useSession, signOut } from "next-auth/react";
 import { usePathname } from "next/navigation";
 import { useState, useRef, useEffect, startTransition } from "react";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
+import { NotificationBell } from "@/components/layout/notification-bell";
 import { cn } from "@/lib/utils";
 
 const navLinks = [
@@ -76,6 +77,7 @@ export function Navbar() {
 
           {session ? (
             <>
+              <NotificationBell />
               {/* Post doubt button */}
               <Link
                 href="/doubts/new"

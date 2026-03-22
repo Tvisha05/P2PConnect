@@ -1,7 +1,22 @@
 import { prisma } from "@/lib/prisma";
+import {
+  notifyHelperNewMatchProposal,
+  notifyMembersOfMutualGroup,
+} from "@/lib/notifications";
+import { POOL_MIN_WAIT_BEFORE_MATCH_MS } from "@/lib/matching/constants";
+
+export { POOL_MIN_WAIT_BEFORE_MATCH_MS } from "@/lib/matching/constants";
 
 const MAX_GROUP_SIZE = 5;
+/** Smallest mutual-help cycle we form (2+ people in the pool). */
 const MIN_GROUP_SIZE = 2;
+/**
+ * Smallest number of waiting-pool rows before we run the engine at all.
+ * One row is enough for one-way matching: a single learner in the pool plus a
+ * helper who is *not* in the pool (strong subjects only). Previously we required
+ * 2+ pool rows, so solo learners never matched and helpers never got proposals.
+ */
+const MIN_POOL_ROWS_TO_RUN = 1;
 const PROPOSAL_EXPIRY_MINUTES = 5;
 
 // ─── Types ──────────────────────────────────────────────
@@ -219,19 +234,29 @@ function tryOneWayGroup(
  * Run the matching engine. Called whenever a new doubt is posted.
  * Creates MatchProposals for helpers to accept/reject.
  */
-export async function triggerMatching(): Promise<void> {
+export async function triggerMatching(options?: {
+  /** Set true in scripts/tests; app always uses the 30s pool wait. */
+  skipPoolMinWait?: boolean;
+}): Promise<void> {
   // Fetch current waiting pool
   const poolEntries = await prisma.waitingPool.findMany({
     orderBy: { joinedAt: "asc" },
   });
 
-  if (poolEntries.length < MIN_GROUP_SIZE) return;
+  if (poolEntries.length < MIN_POOL_ROWS_TO_RUN) return;
 
-  const pool: PoolEntry[] = poolEntries.map((e) => ({
+  const cutoff = new Date(Date.now() - POOL_MIN_WAIT_BEFORE_MATCH_MS);
+  const eligibleRows = options?.skipPoolMinWait
+    ? poolEntries
+    : poolEntries.filter((e) => e.joinedAt <= cutoff);
+
+  if (eligibleRows.length < MIN_POOL_ROWS_TO_RUN) return;
+
+  const pool: PoolEntry[] = eligibleRows.map((e) => ({
     id: e.id,
     userId: e.userId,
     doubtId: e.doubtId,
-    subject: e.subject,
+    subject: e.subject.toLowerCase(),
   }));
 
   // Don't match users who already have pending proposals
@@ -242,7 +267,7 @@ export async function triggerMatching(): Promise<void> {
   const pendingUserIds = new Set(pendingProposals.flatMap((p) => p.members));
   const availablePool = pool.filter((p) => !pendingUserIds.has(p.userId));
 
-  if (availablePool.length < MIN_GROUP_SIZE) return;
+  if (availablePool.length < MIN_POOL_ROWS_TO_RUN) return;
 
   const { graph, strongByUser } = await buildGraph(availablePool);
   const poolUserIds = new Set(availablePool.map((p) => p.userId));
@@ -261,7 +286,7 @@ export async function triggerMatching(): Promise<void> {
     const subjects = [...new Set(cycleSubjects)];
 
     // Cycle groups are auto-accepted (everyone benefits mutually)
-    await prisma.$transaction(async (tx) => {
+    const cycleGroup = await prisma.$transaction(async (tx) => {
       const group = await tx.matchGroup.create({
         data: {
           type: "cycle",
@@ -276,7 +301,6 @@ export async function triggerMatching(): Promise<void> {
         },
       });
 
-      // Remove matched users from pool
       await tx.waitingPool.deleteMany({
         where: { userId: { in: cycle } },
       });
@@ -284,8 +308,18 @@ export async function triggerMatching(): Promise<void> {
       return group;
     });
 
+    try {
+      await notifyMembersOfMutualGroup({
+        groupId: cycleGroup.id,
+        memberUserIds: cycle,
+        subjects,
+      });
+    } catch (err) {
+      console.error("Mutual match notification error:", err);
+    }
+
     // Recursively try more matches with remaining pool
-    return triggerMatching();
+    return triggerMatching(options);
   }
 
   // Step 2: Try one-way helper groups
@@ -307,7 +341,7 @@ export async function triggerMatching(): Promise<void> {
     ];
 
     // Create proposal — only helper needs to confirm
-    await prisma.matchProposal.create({
+    const createdProposal = await prisma.matchProposal.create({
       data: {
         type: "one_way",
         status: "PENDING",
@@ -318,6 +352,17 @@ export async function triggerMatching(): Promise<void> {
         expiresAt,
       },
     });
+
+    try {
+      await notifyHelperNewMatchProposal({
+        proposalId: createdProposal.id,
+        helperId,
+        subjects,
+        learnerIds,
+      });
+    } catch (err) {
+      console.error("Match proposal notification error:", err);
+    }
   }
 }
 

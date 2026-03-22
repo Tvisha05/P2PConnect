@@ -226,7 +226,7 @@ async function main() {
 
   console.log("\nStep 6: Running matching engine...");
   const { triggerMatching } = await import("../src/lib/matching/engine");
-  await triggerMatching();
+  await triggerMatching({ skipPoolMinWait: true });
 
   console.log("\nStep 7: Checking waiting pool (after matching)...");
   await showPool();

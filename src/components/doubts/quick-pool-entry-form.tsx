@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
+import { POOL_MIN_WAIT_BEFORE_MATCH_MS } from "@/lib/matching/constants";
 
 type Urgency = "LOW" | "MEDIUM" | "HIGH";
 
@@ -21,8 +22,17 @@ export function QuickPoolEntryForm({ defaultCategoryId }: Props) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [added, setAdded] = useState(false);
+  const delayedMatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const title = useMemo(() => buildTitle(subject), [subject]);
+
+  useEffect(() => {
+    return () => {
+      if (delayedMatchTimerRef.current) {
+        clearTimeout(delayedMatchTimerRef.current);
+      }
+    };
+  }, []);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -70,6 +80,21 @@ export function QuickPoolEntryForm({ defaultCategoryId }: Props) {
         setError(json.error || "Failed to add to matching pool.");
         return;
       }
+
+      // Re-run matching after the pool min-wait in a fresh request (reliable on serverless;
+      // ensures helpers get proposals + in-app notifications even if the server drops timers).
+      if (delayedMatchTimerRef.current) {
+        clearTimeout(delayedMatchTimerRef.current);
+      }
+      delayedMatchTimerRef.current = setTimeout(() => {
+        delayedMatchTimerRef.current = null;
+        void fetch("/api/matching/trigger", {
+          method: "POST",
+          credentials: "same-origin",
+        }).catch(() => {
+          // non-fatal; server may also schedule matching
+        });
+      }, POOL_MIN_WAIT_BEFORE_MATCH_MS + 1_500);
 
       setAdded(true);
       setSubject("");

@@ -117,7 +117,7 @@ export function RealtimeGroupsPanel({ currentUserId, variant }: Props) {
           {variant === "dashboard" ? "Matched Groups" : "My Groups"}
         </h1>
         <p className="text-muted-foreground mt-2 text-sm">
-          Real-time updates as your pool matches.
+          Updates live. New pool entries wait ~30s before matching runs.
         </p>
       </div>
 

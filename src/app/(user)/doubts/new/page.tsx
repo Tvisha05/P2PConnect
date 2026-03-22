@@ -45,28 +45,11 @@ export default async function PostDoubtPage() {
                 defaultCategoryId={defaultCategoryId}
               />
             ) : (
-              <div className="space-y-3 text-sm text-muted-foreground">
-                <p>
-                  No active categories were found in the database, so the form is hidden.
-                </p>
-                <p className="rounded-xl border border-border bg-muted/40 px-4 py-3 text-foreground">
-                  <span className="font-medium text-foreground">Fix (local / first setup):</span>{" "}
-                  ensure <code className="rounded bg-muted px-1.5 py-0.5 text-xs">DATABASE_URL</code>{" "}
-                  is set, then run{" "}
-                  <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
-                    npx prisma db push
-                  </code>{" "}
-                  and{" "}
-                  <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
-                    npx prisma db seed
-                  </code>
-                  . That creates categories with{" "}
-                  <code className="rounded bg-muted px-1.5 py-0.5 text-xs">isActive: true</code>.
-                </p>
-                <p>
-                  If categories exist but are turned off, an admin must set them active again.
-                </p>
-              </div>
+              <p className="text-sm text-muted-foreground">
+                No active categories. Run{" "}
+                <code className="rounded bg-muted px-1.5 py-0.5 text-xs">npx prisma db seed</code>{" "}
+                or ask an admin to enable categories.
+              </p>
             )}
           </div>
         </section>

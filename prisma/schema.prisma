@@ -44,6 +44,8 @@ enum NotificationType {
   ANNOUNCEMENT
   REPORT_UPDATE
   KARMA_CHANGE
+  MATCH_PROPOSAL
+  MUTUAL_MATCH
 }
 
 enum ReportStatus {

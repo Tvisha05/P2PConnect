@@ -1,9 +1,11 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { createDoubtSchema } from "@/lib/validators";
 import { Prisma } from "@/generated/prisma";
+import { triggerMatching } from "@/lib/matching/engine";
+import { POOL_MIN_WAIT_BEFORE_MATCH_MS } from "@/lib/matching/constants";
 
 const doubtInclude = {
   seeker: { select: { id: true, name: true, image: true } },
@@ -195,7 +197,8 @@ export async function POST(req: NextRequest) {
     include: doubtInclude,
   });
 
-  // Auto-add to waiting pool + trigger matching (non-blocking)
+  // Auto-add to waiting pool + run matching (await first pass so DB + notifications finish
+  // before the response; delayed pass catches the 30s pool window).
   try {
     await prisma.waitingPool.create({
       data: {
@@ -205,9 +208,18 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    import("@/lib/matching/engine")
-      .then(({ triggerMatching }) => triggerMatching())
-      .catch((err) => console.error("Matching trigger error:", err));
+    await triggerMatching().catch((err) =>
+      console.error("Matching trigger error:", err)
+    );
+    // Runs after the response (works on serverless; setTimeout on the request alone can be dropped).
+    after(async () => {
+      try {
+        await new Promise((r) => setTimeout(r, POOL_MIN_WAIT_BEFORE_MATCH_MS));
+        await triggerMatching();
+      } catch (err) {
+        console.error("Delayed matching (after) error:", err);
+      }
+    });
   } catch (err) {
     console.error("Failed to add to waiting pool:", err);
   }

@@ -1,12 +1,14 @@
 "use client";
 
-import { createContext, useContext, useState, useEffect, useCallback, useRef } from "react";
+import { createContext, useContext, useState, useEffect, useCallback } from "react";
 import { useSession } from "next-auth/react";
 import type { NotificationItem } from "@/types";
 
 type NotificationContextType = {
   notifications: NotificationItem[];
   unreadCount: number;
+  /** Set when GET /api/notifications fails (401, 500, network). */
+  inboxError: string | null;
   markAsRead: (ids: string[]) => Promise<void>;
   refresh: () => Promise<void>;
 };
@@ -14,6 +16,7 @@ type NotificationContextType = {
 const NotificationContext = createContext<NotificationContextType>({
   notifications: [],
   unreadCount: 0,
+  inboxError: null,
   markAsRead: async () => {},
   refresh: async () => {},
 });
@@ -23,27 +26,39 @@ export function useNotifications() {
 }
 
 export function NotificationProvider({ children }: { children: React.ReactNode }) {
-  const { data: session } = useSession();
+  const { data: session, status } = useSession();
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
-  const sessionRef = useRef(session);
+  const [inboxError, setInboxError] = useState<string | null>(null);
 
-  useEffect(() => {
-    sessionRef.current = session;
-  }, [session]);
+  const userId = session?.user?.id;
 
   const fetchNotifications = useCallback(async () => {
-    if (!sessionRef.current?.user) return;
+    if (!userId) return;
     try {
-      const res = await fetch("/api/notifications?limit=20");
-      if (!res.ok) return;
+      const res = await fetch("/api/notifications?limit=20", {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        const errData = (await res.json().catch(() => ({}))) as { error?: string };
+        setInboxError(
+          res.status === 401
+            ? "Couldn’t load notifications (session). Try signing out and back in."
+            : typeof errData.error === "string"
+              ? errData.error
+              : `Couldn’t load notifications (HTTP ${res.status}).`
+        );
+        return;
+      }
+      setInboxError(null);
       const data = await res.json();
       setNotifications(data.items ?? []);
-      setUnreadCount(data.unreadCount ?? 0);
+      setUnreadCount(typeof data.unreadCount === "number" ? data.unreadCount : 0);
     } catch {
-      // Silently fail — non-critical
+      setInboxError("Network error while loading notifications.");
     }
-  }, []);
+  }, [userId]);
 
   const markAsRead = useCallback(async (ids: string[]) => {
     if (!ids.length) return;
@@ -51,6 +66,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
       await fetch("/api/notifications", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
         body: JSON.stringify({ ids }),
       });
       setNotifications((prev) =>
@@ -62,20 +78,43 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     }
   }, []);
 
-  // Fetch on mount + poll every 60s
+  // Refetch when session becomes available (fixes: first poll ran while session was still loading)
   useEffect(() => {
+    if (status !== "authenticated" || !userId) {
+      setNotifications([]);
+      setUnreadCount(0);
+      setInboxError(null);
+      return;
+    }
+
     let active = true;
     const poll = () => {
-      if (active) fetchNotifications();
+      if (active) void fetchNotifications();
     };
     poll();
-    const interval = setInterval(poll, 60_000);
-    return () => { active = false; clearInterval(interval); };
-  }, [fetchNotifications]);
+    const interval = setInterval(poll, 15_000);
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void fetchNotifications();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [status, userId, fetchNotifications]);
 
   return (
     <NotificationContext.Provider
-      value={{ notifications, unreadCount, markAsRead, refresh: fetchNotifications }}
+      value={{
+        notifications,
+        unreadCount,
+        inboxError,
+        markAsRead,
+        refresh: fetchNotifications,
+      }}
     >
       {children}
     </NotificationContext.Provider>
