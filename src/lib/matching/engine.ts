@@ -15,13 +15,61 @@ type PoolEntry = {
 
 type Graph = Map<string, string[]>; // userId → [userIds they can help]
 
+type BuildGraphResult = {
+  graph: Graph;
+  /** userId → lowercase strong subjects (for cycle doubt assignment) */
+  strongByUser: Map<string, Set<string>>;
+};
+
+/**
+ * For a cycle [U0, U1, …], member Ui is helped by U(i-1). Pick each member's pool row
+ * so the helper before them actually covers that row's subject (not just `.find()` first row).
+ */
+function resolveCycleMemberDoubts(
+  cycle: string[],
+  pool: PoolEntry[],
+  strongByUser: Map<string, Set<string>>
+): { doubtIds: string[]; subjects: string[] } {
+  const n = cycle.length;
+  const usedPoolEntryIds = new Set<string>();
+  const doubtIds: string[] = [];
+  const subjects: string[] = [];
+
+  for (let i = 0; i < n; i++) {
+    const learnerId = cycle[i]!;
+    const helperId = cycle[(i - 1 + n) % n]!;
+    const helperStrong = strongByUser.get(helperId) ?? new Set();
+
+    const candidates = pool.filter(
+      (p) =>
+        p.userId === learnerId &&
+        !usedPoolEntryIds.has(p.id) &&
+        helperStrong.has(p.subject.toLowerCase())
+    );
+
+    const pick =
+      candidates[0] ??
+      pool.find((p) => p.userId === learnerId && !usedPoolEntryIds.has(p.id));
+
+    if (!pick) {
+      throw new Error(`No pool entry for cycle member ${learnerId}`);
+    }
+
+    usedPoolEntryIds.add(pick.id);
+    doubtIds.push(pick.doubtId);
+    subjects.push(pick.subject);
+  }
+
+  return { doubtIds, subjects };
+}
+
 // ─── Graph Building ─────────────────────────────────────
 
 /**
  * Build directed graph: edge from A → B means A has a strong subject
  * that matches B's doubt subject (A can help B).
  */
-async function buildGraph(pool: PoolEntry[]): Promise<Graph> {
+async function buildGraph(pool: PoolEntry[]): Promise<BuildGraphResult> {
   const graph: Graph = new Map();
   const userIds = [...new Set(pool.map((p) => p.userId))];
 
@@ -82,7 +130,7 @@ async function buildGraph(pool: PoolEntry[]): Promise<Graph> {
     }
   }
 
-  return graph;
+  return { graph, strongByUser: strongMap };
 }
 
 // ─── Cycle Detection ────────────────────────────────────
@@ -196,7 +244,7 @@ export async function triggerMatching(): Promise<void> {
 
   if (availablePool.length < MIN_GROUP_SIZE) return;
 
-  const graph = await buildGraph(availablePool);
+  const { graph, strongByUser } = await buildGraph(availablePool);
   const poolUserIds = new Set(availablePool.map((p) => p.userId));
 
   const expiresAt = new Date(Date.now() + PROPOSAL_EXPIRY_MINUTES * 60 * 1000);
@@ -204,19 +252,13 @@ export async function triggerMatching(): Promise<void> {
   // Step 1: Try cycle groups
   const cycle = tryCycleGroups(graph, poolUserIds);
   if (cycle) {
-    // In a cycle, everyone is both helper and learner — auto-form the group
-    const memberDoubtIds = cycle.map((userId) => {
-      const entry = availablePool.find((p) => p.userId === userId);
-      return entry!.doubtId;
-    });
-    const subjects = [
-      ...new Set(
-        cycle.map((userId) => {
-          const entry = availablePool.find((p) => p.userId === userId);
-          return entry!.subject;
-        })
-      ),
-    ];
+    // In a cycle, everyone is both helper and learner — auto-form the group.
+    // Each user may have multiple pool rows; pick the row whose subject the *previous*
+    // person in the cycle can actually help with (e.g. B has os + dbms but only dbms
+    // matches A's strong subjects → attach dbms, not the first row "os").
+    const { doubtIds: memberDoubtIds, subjects: cycleSubjects } =
+      resolveCycleMemberDoubts(cycle, availablePool, strongByUser);
+    const subjects = [...new Set(cycleSubjects)];
 
     // Cycle groups are auto-accepted (everyone benefits mutually)
     await prisma.$transaction(async (tx) => {
@@ -227,7 +269,7 @@ export async function triggerMatching(): Promise<void> {
           members: {
             create: cycle.map((userId, i) => ({
               userId,
-              doubtId: memberDoubtIds[i],
+              doubtId: memberDoubtIds[i]!,
               role: "helper", // everyone is both
             })),
           },
