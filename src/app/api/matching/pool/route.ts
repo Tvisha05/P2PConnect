@@ -10,7 +10,7 @@ export async function GET() {
     if (!session?.user?.id) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-
+// adds user id, name, image, doubt id, title, subject, urgency into the pool 
     const pool = await prisma.waitingPool.findMany({
       orderBy: { joinedAt: "asc" },
       include: {

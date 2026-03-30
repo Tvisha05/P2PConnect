@@ -7,7 +7,7 @@ import { POOL_MIN_WAIT_BEFORE_MATCH_MS } from "@/lib/matching/constants";
 
 export { POOL_MIN_WAIT_BEFORE_MATCH_MS } from "@/lib/matching/constants";
 
-const MAX_GROUP_SIZE = 5;
+const MAX_GROUP_SIZE = 4;
 /** Smallest mutual-help cycle we form (2+ people in the pool). */
 const MIN_GROUP_SIZE = 2;
 /**
@@ -18,6 +18,15 @@ const MIN_GROUP_SIZE = 2;
  */
 const MIN_POOL_ROWS_TO_RUN = 1;
 const PROPOSAL_EXPIRY_MINUTES = 5;
+/** Cap total time spent in cycle DFS per `tryCycleGroups` call (worst-case guard). */
+const MAX_DFS_TIME_MS = 200;
+
+/** Higher = matched first; ties broken by earlier `joinedAt` on each pool row. */
+const URGENCY_WEIGHT: Record<"HIGH" | "MEDIUM" | "LOW", number> = {
+  HIGH: 3,
+  MEDIUM: 2,
+  LOW: 1,
+};
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -26,6 +35,8 @@ type PoolEntry = {
   userId: string;
   doubtId: string;
   subject: string; // lowercase
+  urgency: "HIGH" | "MEDIUM" | "LOW";
+  joinedAt: Date;
 };
 
 type Graph = Map<string, string[]>; // userId → [userIds they can help]
@@ -84,7 +95,10 @@ function resolveCycleMemberDoubts(
  * Build directed graph: edge from A → B means A has a strong subject
  * that matches B's doubt subject (A can help B).
  */
-async function buildGraph(pool: PoolEntry[]): Promise<BuildGraphResult> {
+async function buildGraph(
+  pool: PoolEntry[],
+  options?: { includeExternalHelpers?: boolean }
+): Promise<BuildGraphResult> {
   const graph: Graph = new Map();
   const userIds = [...new Set(pool.map((p) => p.userId))];
 
@@ -103,27 +117,29 @@ async function buildGraph(pool: PoolEntry[]): Promise<BuildGraphResult> {
     strongMap.set(profile.userId, subjects);
   }
 
-  // Also fetch strong subjects from ALL users (not just pool) who could help
-  const allHelpers = await prisma.academicProfile.findMany({
-    where: {
-      subjectAffinities: {
-        some: {
-          subject: {
-            in: pool.map((p) => p.subject),
-            mode: "insensitive",
+  // Optionally include external helpers (outside the waiting pool).
+  if (options?.includeExternalHelpers !== false) {
+    const allHelpers = await prisma.academicProfile.findMany({
+      where: {
+        subjectAffinities: {
+          some: {
+            subject: {
+              in: pool.map((p) => p.subject),
+              mode: "insensitive",
+            },
           },
         },
       },
-    },
-    include: { subjectAffinities: true },
-  });
+      include: { subjectAffinities: true },
+    });
 
-  for (const helper of allHelpers) {
-    if (!strongMap.has(helper.userId)) {
-      const subjects = new Set(
-        helper.subjectAffinities.map((a) => a.subject.toLowerCase())
-      );
-      strongMap.set(helper.userId, subjects);
+    for (const helper of allHelpers) {
+      if (!strongMap.has(helper.userId)) {
+        const subjects = new Set(
+          helper.subjectAffinities.map((a) => a.subject.toLowerCase())
+        );
+        strongMap.set(helper.userId, subjects);
+      }
     }
   }
 
@@ -151,6 +167,55 @@ async function buildGraph(pool: PoolEntry[]): Promise<BuildGraphResult> {
 // ─── Cycle Detection ────────────────────────────────────
 
 /**
+ * DFS to close a simple directed cycle: start → … → current → start.
+ * `path` is mutated and restored on backtrack; on success returns a copy.
+ * Prunes dead branches, limits fan-out, and respects `dfsStartDeadline`.
+ */
+function findCycleDFS(
+  graph: Graph,
+  poolUserIds: Set<string>,
+  start: string,
+  current: string,
+  visited: Set<string>,
+  path: string[],
+  targetSize: number,
+  dfsStartDeadline: number
+): string[] | null {
+  if (Date.now() > dfsStartDeadline) return null;
+
+  if (path.length === targetSize) {
+    const neighbors = graph.get(current) || [];
+    return neighbors.includes(start) ? path.slice() : null;
+  }
+
+  const neighbors = (graph.get(current) || []).filter((n) =>
+    poolUserIds.has(n)
+  );
+
+  for (const next of neighbors) {
+    if (visited.has(next)) continue;
+
+    visited.add(next);
+    path.push(next);
+    const found = findCycleDFS(
+      graph,
+      poolUserIds,
+      start,
+      next,
+      visited,
+      path,
+      targetSize,
+      dfsStartDeadline
+    );
+    if (found) return found;
+    path.pop();
+    visited.delete(next);
+  }
+
+  return null;
+}
+
+/**
  * Find a mutual-benefit cycle of given size in the pool.
  * A cycle means: A helps B, B helps C, ..., N helps A.
  * Each member must be in the pool (have an active doubt).
@@ -158,30 +223,32 @@ async function buildGraph(pool: PoolEntry[]): Promise<BuildGraphResult> {
 function findCycleOfSize(
   graph: Graph,
   poolUserIds: Set<string>,
-  size: number
+  size: number,
+  dfsStartedAt: number
 ): string[] | null {
-  const users = [...poolUserIds];
-  if (users.length < size) return null;
+  if (poolUserIds.size < size) return null;
 
-  // Generate combinations of `size` users from pool
-  const combos = combinations(users, size);
+  const dfsStartDeadline = dfsStartedAt + MAX_DFS_TIME_MS;
 
-  for (const combo of combos) {
-    // Try all permutations to find a valid cycle
-    const perms = permutations(combo);
-    for (const perm of perms) {
-      let valid = true;
-      for (let i = 0; i < size; i++) {
-        const curr = perm[i];
-        const next = perm[(i + 1) % size];
-        const neighbors = graph.get(curr) || [];
-        if (!neighbors.includes(next)) {
-          valid = false;
-          break;
-        }
-      }
-      if (valid) return perm;
-    }
+  // Natural iteration order (no degree-based bias).
+  for (const start of poolUserIds) {
+    if (Date.now() > dfsStartDeadline) return null;
+    const out = graph.get(start);
+    if (!out?.some((n) => poolUserIds.has(n))) continue;
+
+    const visited = new Set<string>([start]);
+    const path = [start];
+    const cycle = findCycleDFS(
+      graph,
+      poolUserIds,
+      start,
+      start,
+      visited,
+      path,
+      size,
+      dfsStartDeadline
+    );
+    if (cycle) return cycle;
   }
 
   return null;
@@ -194,11 +261,23 @@ function tryCycleGroups(
   graph: Graph,
   poolUserIds: Set<string>
 ): string[] | null {
+  const dfsStartedAt = Date.now();
   const maxSize = Math.min(MAX_GROUP_SIZE, poolUserIds.size);
-  for (let size = maxSize; size >= MIN_GROUP_SIZE; size--) {
-    const cycle = findCycleOfSize(graph, poolUserIds, size);
+
+  // Prefer mutual cycles of size >= 3 over one-way matching.
+  for (let size = maxSize; size >= 3; size--) {
+    if (Date.now() - dfsStartedAt > MAX_DFS_TIME_MS) return null;
+    const cycle = findCycleOfSize(graph, poolUserIds, size, dfsStartedAt);
     if (cycle) return cycle;
   }
+
+  // Only fall back to size-2 cycles when no size>=3 cycle was found.
+  if (poolUserIds.size >= 2) {
+    if (Date.now() - dfsStartedAt > MAX_DFS_TIME_MS) return null;
+    const cycle2 = findCycleOfSize(graph, poolUserIds, 2, dfsStartedAt);
+    if (cycle2) return cycle2;
+  }
+
   return null;
 }
 
@@ -238,14 +317,24 @@ export async function triggerMatching(options?: {
   /** Set true in scripts/tests; app always uses the 30s pool wait. */
   skipPoolMinWait?: boolean;
 }): Promise<void> {
-  // Fetch current waiting pool
-  const poolEntries = await prisma.waitingPool.findMany({
+  let poolEntries = await prisma.waitingPool.findMany({
     orderBy: { joinedAt: "asc" },
+    include: {
+      doubt: { select: { urgency: true } },
+    },
   });
 
   if (poolEntries.length < MIN_POOL_ROWS_TO_RUN) return;
 
   const cutoff = new Date(Date.now() - POOL_MIN_WAIT_BEFORE_MATCH_MS);
+
+  const pendingProposals = await prisma.matchProposal.findMany({
+    where: { status: "PENDING" },
+    select: { members: true },
+  });
+  const pendingUserIds = new Set(pendingProposals.flatMap((p) => p.members));
+
+  // STEP 1: Build graph ONLY with pool users, then try cycle detection.
   const eligibleRows = options?.skipPoolMinWait
     ? poolEntries
     : poolEntries.filter((e) => e.joinedAt <= cutoff);
@@ -257,35 +346,45 @@ export async function triggerMatching(options?: {
     userId: e.userId,
     doubtId: e.doubtId,
     subject: e.subject.toLowerCase(),
+    urgency: e.doubt.urgency,
+    joinedAt: e.joinedAt,
   }));
 
-  // Don't match users who already have pending proposals
-  const pendingProposals = await prisma.matchProposal.findMany({
-    where: { status: "PENDING" },
-    select: { members: true },
-  });
-  const pendingUserIds = new Set(pendingProposals.flatMap((p) => p.members));
   const availablePool = pool.filter((p) => !pendingUserIds.has(p.userId));
-
   if (availablePool.length < MIN_POOL_ROWS_TO_RUN) return;
 
-  const { graph, strongByUser } = await buildGraph(availablePool);
-  const poolUserIds = new Set(availablePool.map((p) => p.userId));
+  const CYCLE_ONLY_WINDOW_MS = 30000;
+  const now = Date.now();
+  const oldestJoinTime = Math.min(
+    ...availablePool.map((p) => p.joinedAt.getTime())
+  );
+  const withinCycleOnlyWindow = now - oldestJoinTime < CYCLE_ONLY_WINDOW_MS;
 
-  const expiresAt = new Date(Date.now() + PROPOSAL_EXPIRY_MINUTES * 60 * 1000);
+  // Higher urgency first; same urgency → earlier joinedAt first.
+  const sortedPool = [...availablePool].sort((a, b) => {
+    const urgencyDiff = URGENCY_WEIGHT[b.urgency] - URGENCY_WEIGHT[a.urgency];
+    if (urgencyDiff !== 0) return urgencyDiff;
+    return a.joinedAt.getTime() - b.joinedAt.getTime();
+  });
 
-  // Step 1: Try cycle groups
-  const cycle = tryCycleGroups(graph, poolUserIds);
+  /** First row per user in urgency sort order — same as `sortedPool.find(p => p.userId === id)`. */
+  const userToPoolEntry = new Map<string, PoolEntry>();
+  for (const p of sortedPool) {
+    if (!userToPoolEntry.has(p.userId)) userToPoolEntry.set(p.userId, p);
+  }
+
+  const poolUserIdsFull = new Set(sortedPool.map((p) => p.userId));
+
+  const { graph: poolGraph, strongByUser: poolStrongByUser } =
+    await buildGraph(sortedPool, { includeExternalHelpers: false });
+
+  const cycle = tryCycleGroups(poolGraph, poolUserIdsFull);
   if (cycle) {
-    // In a cycle, everyone is both helper and learner — auto-form the group.
-    // Each user may have multiple pool rows; pick the row whose subject the *previous*
-    // person in the cycle can actually help with (e.g. B has os + dbms but only dbms
-    // matches A's strong subjects → attach dbms, not the first row "os").
+    // IF cycle found → DONE
     const { doubtIds: memberDoubtIds, subjects: cycleSubjects } =
-      resolveCycleMemberDoubts(cycle, availablePool, strongByUser);
+      resolveCycleMemberDoubts(cycle, sortedPool, poolStrongByUser);
     const subjects = [...new Set(cycleSubjects)];
 
-    // Cycle groups are auto-accepted (everyone benefits mutually)
     const cycleGroup = await prisma.$transaction(async (tx) => {
       const group = await tx.matchGroup.create({
         data: {
@@ -295,7 +394,7 @@ export async function triggerMatching(options?: {
             create: cycle.map((userId, i) => ({
               userId,
               doubtId: memberDoubtIds[i]!,
-              role: "helper", // everyone is both
+              role: "helper",
             })),
           },
         },
@@ -308,62 +407,59 @@ export async function triggerMatching(options?: {
       return group;
     });
 
-    try {
-      await notifyMembersOfMutualGroup({
-        groupId: cycleGroup.id,
-        memberUserIds: cycle,
-        subjects,
-      });
-    } catch (err) {
+    void notifyMembersOfMutualGroup({
+      groupId: cycleGroup.id,
+      memberUserIds: cycle,
+      subjects,
+    }).catch((err) => {
       console.error("Mutual match notification error:", err);
-    }
-
-    // Recursively try more matches with remaining pool
-    return triggerMatching(options);
-  }
-
-  // Step 2: Try one-way helper groups
-  const oneWay = tryOneWayGroup(graph, poolUserIds);
-  if (oneWay) {
-    const { helperId, learnerIds } = oneWay;
-    const allMembers = [helperId, ...learnerIds];
-    const doubtIds = learnerIds.map((id) => {
-      const entry = availablePool.find((p) => p.userId === id);
-      return entry!.doubtId;
-    });
-    const subjects = [
-      ...new Set(
-        learnerIds.map((id) => {
-          const entry = availablePool.find((p) => p.userId === id);
-          return entry!.subject;
-        })
-      ),
-    ];
-
-    // Create proposal — only helper needs to confirm
-    const createdProposal = await prisma.matchProposal.create({
-      data: {
-        type: "one_way",
-        status: "PENDING",
-        members: allMembers,
-        doubtIds,
-        subjects,
-        helperId,
-        expiresAt,
-      },
     });
 
-    try {
-      await notifyHelperNewMatchProposal({
-        proposalId: createdProposal.id,
-        helperId,
-        subjects,
-        learnerIds,
-      });
-    } catch (err) {
-      console.error("Match proposal notification error:", err);
-    }
+    return;
   }
+
+  // If still within the initial 30s cycle-only window, do NOT attempt one-way.
+  if (withinCycleOnlyWindow) return;
+
+  // ELSE (>= 30s):
+  // STEP 3: fetch external helpers
+  // STEP 4: build extended graph
+  // STEP 5: one-way matching
+  const { graph: extendedGraph } = await buildGraph(sortedPool, {
+    includeExternalHelpers: true,
+  });
+
+  const oneWay = tryOneWayGroup(extendedGraph, poolUserIdsFull);
+  if (!oneWay) return;
+
+  const expiresAt = new Date(Date.now() + PROPOSAL_EXPIRY_MINUTES * 60 * 1000);
+  const { helperId, learnerIds } = oneWay;
+  const allMembers = [helperId, ...learnerIds];
+  const doubtIds = learnerIds.map((id) => userToPoolEntry.get(id)!.doubtId);
+  const subjects = [
+    ...new Set(learnerIds.map((id) => userToPoolEntry.get(id)!.subject)),
+  ];
+
+  const createdProposal = await prisma.matchProposal.create({
+    data: {
+      type: "one_way",
+      status: "PENDING",
+      members: allMembers,
+      doubtIds,
+      subjects,
+      helperId,
+      expiresAt,
+    },
+  });
+
+  void notifyHelperNewMatchProposal({
+    proposalId: createdProposal.id,
+    helperId,
+    subjects,
+    learnerIds,
+  }).catch((err) => {
+    console.error("Match proposal notification error:", err);
+  });
 }
 
 // ─── Proposal Actions ───────────────────────────────────
@@ -435,34 +531,4 @@ export async function rejectProposal(proposalId: string, helperId: string) {
 
   // Everyone stays in pool — try matching again
   await triggerMatching();
-}
-
-// ─── Utility: Combinations & Permutations ───────────────
-
-function combinations<T>(arr: T[], size: number): T[][] {
-  if (size === 0) return [[]];
-  if (arr.length < size) return [];
-
-  const result: T[][] = [];
-  for (let i = 0; i <= arr.length - size; i++) {
-    const rest = combinations(arr.slice(i + 1), size - 1);
-    for (const combo of rest) {
-      result.push([arr[i], ...combo]);
-    }
-  }
-  return result;
-}
-
-function permutations<T>(arr: T[]): T[][] {
-  if (arr.length <= 1) return [arr];
-
-  const result: T[][] = [];
-  for (let i = 0; i < arr.length; i++) {
-    const rest = [...arr.slice(0, i), ...arr.slice(i + 1)];
-    const perms = permutations(rest);
-    for (const perm of perms) {
-      result.push([arr[i], ...perm]);
-    }
-  }
-  return result;
 }

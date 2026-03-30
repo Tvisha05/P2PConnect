@@ -81,20 +81,9 @@ export function QuickPoolEntryForm({ defaultCategoryId }: Props) {
         return;
       }
 
-      // Re-run matching after the pool min-wait in a fresh request (reliable on serverless;
-      // ensures helpers get proposals + in-app notifications even if the server drops timers).
-      if (delayedMatchTimerRef.current) {
-        clearTimeout(delayedMatchTimerRef.current);
-      }
-      delayedMatchTimerRef.current = setTimeout(() => {
-        delayedMatchTimerRef.current = null;
-        void fetch("/api/matching/trigger", {
-          method: "POST",
-          credentials: "same-origin",
-        }).catch(() => {
-          // non-fatal; server may also schedule matching
-        });
-      }, POOL_MIN_WAIT_BEFORE_MATCH_MS + 1_500);
+      // Matching is already scheduled on the server side after the pool
+      // min-wait window. Avoid triggering it again from the client to prevent
+      // duplicate group/proposal creation.
 
       setAdded(true);
       setSubject("");

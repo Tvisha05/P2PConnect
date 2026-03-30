@@ -136,29 +136,6 @@ export async function POST(req: NextRequest) {
         "Need help understanding ".repeat(2) +
         "Please explain the key concepts and share a worked example.";
 
-  // Rate limit check
-  const now = new Date();
-  const windowStart = new Date(now.getTime() - 60 * 60 * 1000); // 1 hour ago
-  const recentCount = await prisma.doubt.count({
-    where: {
-      seekerId: session.user.id,
-      createdAt: { gte: windowStart },
-    },
-  });
-
-  // Get configurable rate limit (default 5)
-  const rateLimitConfig = await prisma.systemConfig.findUnique({
-    where: { key: "ratelimit.doubts_per_hour" },
-  });
-  const maxPerHour = parseInt(rateLimitConfig?.value ?? "5");
-
-  if (recentCount >= maxPerHour) {
-    return NextResponse.json(
-      { error: `Rate limit exceeded. Max ${maxPerHour} doubts per hour.` },
-      { status: 429 }
-    );
-  }
-
   // Verify category exists
   const category = await prisma.category.findUnique({ where: { id: categoryId } });
   if (!category || !category.isActive) {
@@ -208,10 +185,9 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    await triggerMatching().catch((err) =>
-      console.error("Matching trigger error:", err)
-    );
-    // Runs after the response (works on serverless; setTimeout on the request alone can be dropped).
+    // Run matching once after the pool min-wait window.
+    // Avoid a second immediate matching pass here; duplicate group/proposal creation
+    // is caused by concurrent triggerMatching() invocations.
     after(async () => {
       try {
         await new Promise((r) => setTimeout(r, POOL_MIN_WAIT_BEFORE_MATCH_MS));

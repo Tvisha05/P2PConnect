@@ -612,6 +612,7 @@ model WaitingPool {
   doubt Doubt @relation(fields: [doubtId], references: [id], onDelete: Cascade)
 
   @@index([subject])
+  @@index([userId])
   @@index([joinedAt])
   @@map("waiting_pool")
 }
@@ -629,6 +630,7 @@ model MatchProposal {
   updatedAt DateTime            @updatedAt
 
   @@index([status, expiresAt])
+  @@index([status])
   @@index([helperId, status])
   @@map("match_proposals")
 }
