@@ -1,0 +1,716 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────
+
+enum UserRole {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum DoubtStatus {
+  OPEN
+  CLAIMED
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum Urgency {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum MessageContentType {
+  TEXT
+  IMAGE
+  FILE
+  CODE
+}
+
+enum NotificationType {
+  DOUBT_CLAIMED
+  NEW_MESSAGE
+  DOUBT_RESOLVED
+  TAG_NEW_DOUBT
+  ANNOUNCEMENT
+  REPORT_UPDATE
+  KARMA_CHANGE
+  MATCH_PROPOSAL
+  MUTUAL_MATCH
+}
+
+enum ReportStatus {
+  PENDING
+  REVIEWED
+  RESOLVED
+  DISMISSED
+}
+
+enum ReportTargetType {
+  DOUBT
+  MESSAGE
+  USER
+}
+
+enum TagStatus {
+  SUGGESTED
+  APPROVED
+  REJECTED
+}
+
+enum AbandonApproval {
+  PENDING
+  APPROVED
+  DISAPPROVED
+}
+
+enum Department {
+  CSE
+  ECE
+  EEE
+  ME
+  CE
+  IT
+  AI_ML
+  DS
+  CIVIL
+  OTHER
+}
+
+enum MatchProposalStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+// ─── Auth Tables ─────────────────────────────────────────
+
+model User {
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  role          UserRole  @default(USER)
+  karma         Int       @default(0)
+  bio           String?
+  profileComplete Boolean   @default(false)
+  isBanned      Boolean   @default(false)
+  bannedAt      DateTime?
+  banReason     String?
+  publicKey     String?
+  lastActiveAt  DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  academicProfile AcademicProfile?
+  accounts        Account[]
+  sessions        Session[]
+  seekerDoubts    Doubt[]            @relation("Seeker")
+  helperDoubts    Doubt[]            @relation("Helper")
+  messages        Message[]
+  readReceipts    MessageReadReceipt[]
+  userCategories  UserCategory[]
+  userTags        UserTag[]
+  tagVotes        TagVote[]
+  suggestedTags   Tag[]              @relation("TagSuggester")
+  votes           Vote[]
+  bookmarks       Bookmark[]
+  helperDismissalsAsHelper HelperDismissal[] @relation("DismissedHelper")
+  helperDismissalsAsSeeker HelperDismissal[] @relation("DismissingSeeker")
+  abandonRequestsAsHelper  AbandonRequest[]  @relation("AbandonHelper")
+  abandonRequestsAsSeeker  AbandonRequest[]  @relation("AbandonSeeker")
+  karmaEvents     KarmaEvent[]
+  notificationsReceived Notification[] @relation("NotificationRecipient")
+  notificationsSent     Notification[] @relation("NotificationSender")
+  emailPreference EmailPreference?
+  reportsFiled    Report[]           @relation("Reporter")
+  reportsTargeted Report[]           @relation("ReportTarget")
+  announcements   Announcement[]
+  rateLimits      RateLimit[]
+  waitingPool     WaitingPool[]
+  groupMessages      GroupMessage[]
+  groupMessageReads  GroupMessageRead[]
+  groupEncryptedKeys GroupEncryptedKey[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(auto()) @map("_id") @db.ObjectId
+  userId            String  @db.ObjectId
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  sessionToken String   @unique
+  userId       String   @db.ObjectId
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ─── Core Tables ─────────────────────────────────────────
+
+model Doubt {
+  id             String      @id @default(auto()) @map("_id") @db.ObjectId
+  title          String
+  description    String
+  subject        String      // matching key — e.g. "Data Structures", "Thermodynamics"
+  status         DoubtStatus @default(OPEN)
+  urgency        Urgency     @default(MEDIUM)
+  categoryId     String      @db.ObjectId
+  seekerId       String      @db.ObjectId
+  helperId       String?     @db.ObjectId
+  claimedAt      DateTime?
+  inProgressAt   DateTime?
+  resolvedAt     DateTime?
+  lastActivityAt DateTime    @default(now())
+  upvoteCount    Int         @default(0)
+  downvoteCount  Int         @default(0)
+  viewCount      Int         @default(0)
+  isEdited       Boolean     @default(false)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  category    Category          @relation(fields: [categoryId], references: [id])
+  seeker      User              @relation("Seeker", fields: [seekerId], references: [id])
+  helper      User?             @relation("Helper", fields: [helperId], references: [id])
+  tags        DoubtTag[]
+  attachments DoubtAttachment[]
+  messages    Message[]
+  votes       Vote[]
+  bookmarks   Bookmark[]
+  dismissals  HelperDismissal[]
+  abandonRequests AbandonRequest[]
+  reports     Report[]
+  waitingPool WaitingPool?
+
+  @@index([subject])
+  @@index([status])
+  @@index([status, categoryId])
+  @@index([status, urgency])
+  @@index([createdAt])
+  @@index([upvoteCount])
+  @@index([lastActivityAt])
+  @@index([seekerId])
+  @@index([helperId])
+  @@map("doubts")
+}
+
+model DoubtAttachment {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  doubtId     String   @db.ObjectId
+  fileName    String
+  fileUrl     String
+  fileType    String
+  fileSizeKb  Int
+  storagePath String
+  createdAt   DateTime @default(now())
+
+  doubt Doubt @relation(fields: [doubtId], references: [id], onDelete: Cascade)
+
+  @@map("doubt_attachments")
+}
+
+model DoubtTag {
+  id      String @id @default(auto()) @map("_id") @db.ObjectId
+  doubtId String @db.ObjectId
+  tagId   String @db.ObjectId
+
+  doubt Doubt @relation(fields: [doubtId], references: [id], onDelete: Cascade)
+  tag   Tag   @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([doubtId, tagId])
+  @@map("doubt_tags")
+}
+
+model Message {
+  id          String             @id @default(auto()) @map("_id") @db.ObjectId
+  doubtId     String             @db.ObjectId
+  senderId    String             @db.ObjectId
+  content     String
+  contentType MessageContentType @default(TEXT)
+  replyToId   String?            @db.ObjectId
+  isEdited    Boolean            @default(false)
+  isDeleted   Boolean            @default(false)
+  upvoteCount Int                @default(0)
+  downvoteCount Int              @default(0)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  doubt       Doubt              @relation(fields: [doubtId], references: [id], onDelete: Cascade)
+  sender      User               @relation(fields: [senderId], references: [id])
+  replyTo     Message?           @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  replies     Message[]          @relation("MessageReplies")
+  attachments MessageAttachment[]
+  readReceipts MessageReadReceipt[]
+  votes       Vote[]
+  reports     Report[]
+
+  @@index([doubtId, createdAt])
+  @@map("messages")
+}
+
+model MessageAttachment {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  messageId   String   @db.ObjectId
+  fileName    String
+  fileUrl     String
+  fileType    String
+  fileSizeKb  Int
+  storagePath String
+  createdAt   DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@map("message_attachments")
+}
+
+model MessageReadReceipt {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  messageId String   @db.ObjectId
+  userId    String   @db.ObjectId
+  readAt    DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId])
+  @@map("message_read_receipts")
+}
+
+// ─── Taxonomy Tables ─────────────────────────────────────
+
+model Category {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  iconUrl     String?
+  sortOrder   Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  doubts         Doubt[]
+  userCategories UserCategory[]
+
+  @@map("categories")
+}
+
+model Tag {
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
+  name          String    @unique
+  slug          String    @unique
+  status        TagStatus @default(SUGGESTED)
+  suggestedById String?   @db.ObjectId
+  voteCount     Int       @default(0)
+  reviewedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  suggestedBy User?      @relation("TagSuggester", fields: [suggestedById], references: [id])
+  doubtTags   DoubtTag[]
+  tagVotes    TagVote[]
+  userTags    UserTag[]
+
+  @@index([status, voteCount])
+  @@map("tags")
+}
+
+model TagVote {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  tagId     String   @db.ObjectId
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tagId])
+  @@map("tag_votes")
+}
+
+model UserCategory {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String   @db.ObjectId
+  categoryId String   @db.ObjectId
+  createdAt  DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, categoryId])
+  @@map("user_categories")
+}
+
+model UserTag {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  tagId     String   @db.ObjectId
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tagId])
+  @@map("user_tags")
+}
+
+// ─── Interaction Tables ──────────────────────────────────
+
+model Vote {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  value     Int      // +1 or -1
+  doubtId   String?  @db.ObjectId
+  messageId String?  @db.ObjectId
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  doubt   Doubt?   @relation(fields: [doubtId], references: [id], onDelete: Cascade)
+  message Message? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, doubtId])
+  @@unique([userId, messageId])
+  @@map("votes")
+}
+
+model Bookmark {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  doubtId   String   @db.ObjectId
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  doubt Doubt @relation(fields: [doubtId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, doubtId])
+  @@index([userId, createdAt])
+  @@map("bookmarks")
+}
+
+model HelperDismissal {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  doubtId      String   @db.ObjectId
+  helperId     String   @db.ObjectId
+  seekerId     String   @db.ObjectId
+  reason       String
+  karmaPenalty Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  doubt  Doubt @relation(fields: [doubtId], references: [id], onDelete: Cascade)
+  helper User  @relation("DismissedHelper", fields: [helperId], references: [id])
+  seeker User  @relation("DismissingSeeker", fields: [seekerId], references: [id])
+
+  @@map("helper_dismissals")
+}
+
+model AbandonRequest {
+  id         String          @id @default(auto()) @map("_id") @db.ObjectId
+  doubtId    String          @db.ObjectId
+  helperId   String          @db.ObjectId
+  seekerId   String          @db.ObjectId
+  reason     String
+  approval   AbandonApproval @default(PENDING)
+  reviewedAt DateTime?
+  createdAt  DateTime        @default(now())
+
+  doubt  Doubt @relation(fields: [doubtId], references: [id], onDelete: Cascade)
+  helper User  @relation("AbandonHelper", fields: [helperId], references: [id])
+  seeker User  @relation("AbandonSeeker", fields: [seekerId], references: [id])
+
+  @@map("abandon_requests")
+}
+
+// ─── System Tables ───────────────────────────────────────
+
+model KarmaEvent {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  delta     Int
+  reason    String
+  sourceId  String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("karma_events")
+}
+
+model Notification {
+  id          String           @id @default(auto()) @map("_id") @db.ObjectId
+  recipientId String           @db.ObjectId
+  senderId    String?          @db.ObjectId
+  type        NotificationType
+  title       String
+  body        String
+  linkUrl     String?
+  isRead      Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+
+  recipient User  @relation("NotificationRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  sender    User? @relation("NotificationSender", fields: [senderId], references: [id])
+
+  @@index([recipientId, isRead, createdAt])
+  @@map("notifications")
+}
+
+model EmailPreference {
+  id             String  @id @default(auto()) @map("_id") @db.ObjectId
+  userId         String  @unique @db.ObjectId
+  doubtClaimed   Boolean @default(true)
+  newMessage     Boolean @default(true)
+  doubtResolved  Boolean @default(true)
+  tagNewDoubt    Boolean @default(true)
+  announcements  Boolean @default(true)
+  weeklyDigest   Boolean @default(true)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("email_preferences")
+}
+
+model Report {
+  id           String           @id @default(auto()) @map("_id") @db.ObjectId
+  reporterId   String           @db.ObjectId
+  targetType   ReportTargetType
+  doubtId      String?          @db.ObjectId
+  messageId    String?          @db.ObjectId
+  targetUserId String?          @db.ObjectId
+  reason       String
+  status       ReportStatus     @default(PENDING)
+  adminNotes   String?
+  reviewedBy   String?
+  reviewedAt   DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  reporter   User     @relation("Reporter", fields: [reporterId], references: [id])
+  doubt      Doubt?   @relation(fields: [doubtId], references: [id], onDelete: SetNull)
+  message    Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  targetUser User?    @relation("ReportTarget", fields: [targetUserId], references: [id])
+
+  @@index([targetType, status])
+  @@map("reports")
+}
+
+model Announcement {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  authorId  String   @db.ObjectId
+  title     String
+  body      String
+  sendEmail Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  author User @relation(fields: [authorId], references: [id])
+
+  @@map("announcements")
+}
+
+model SystemConfig {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("system_configs")
+}
+
+model RateLimit {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @db.ObjectId
+  action      String
+  windowStart DateTime
+  count       Int      @default(1)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, action, windowStart])
+  @@map("rate_limits")
+}
+
+// ─── Academic Profile Tables ────────────────────────────
+
+model AcademicProfile {
+  id         String     @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String     @unique @db.ObjectId
+  rollNumber String     @unique
+  department Department
+  year       Int        // 1-4
+  semester   Int        // 1-8
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  user              User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subjectAffinities SubjectAffinity[]
+
+  @@map("academic_profiles")
+}
+
+model SubjectAffinity {
+  id                String   @id @default(auto()) @map("_id") @db.ObjectId
+  academicProfileId String   @db.ObjectId
+  subject           String   // strong subject — what the user can teach
+  createdAt         DateTime @default(now())
+
+  academicProfile AcademicProfile @relation(fields: [academicProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([academicProfileId, subject])
+  @@map("subject_affinities")
+}
+
+// ─── Matching Tables ────────────────────────────────────
+
+model WaitingPool {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  doubtId   String   @unique @db.ObjectId
+  subject   String   // the doubt's subject — matching key
+  joinedAt  DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  doubt Doubt @relation(fields: [doubtId], references: [id], onDelete: Cascade)
+
+  @@index([subject])
+  @@index([userId])
+  @@index([joinedAt])
+  @@map("waiting_pool")
+}
+
+model MatchProposal {
+  id        String              @id @default(auto()) @map("_id") @db.ObjectId
+  type      String              // "cycle" or "one_way"
+  status    MatchProposalStatus @default(PENDING)
+  members   String[]            // userIds in the group
+  doubtIds  String[]            // corresponding doubtIds
+  subjects  String[]            // subjects involved
+  helperId  String?             @db.ObjectId // helper who needs to confirm (one_way only)
+  expiresAt DateTime
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  @@index([status, expiresAt])
+  @@index([status])
+  @@index([helperId, status])
+  @@map("match_proposals")
+}
+
+model MatchGroup {
+  id        String             @id @default(auto()) @map("_id") @db.ObjectId
+  type      String             // "cycle" or "one_way"
+  subjects  String[]
+  createdAt DateTime           @default(now())
+
+  members       MatchGroupMember[]
+  messages      GroupMessage[]
+  encryptedKeys GroupEncryptedKey[]
+
+  @@map("match_groups")
+}
+
+model GroupEncryptedKey {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  matchGroupId String   @db.ObjectId
+  userId       String   @db.ObjectId
+  encryptedKey String
+  createdAt    DateTime @default(now())
+
+  matchGroup MatchGroup @relation(fields: [matchGroupId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([matchGroupId, userId])
+  @@map("group_encrypted_keys")
+}
+
+model GroupMessage {
+  id           String             @id @default(auto()) @map("_id") @db.ObjectId
+  matchGroupId String             @db.ObjectId
+  senderId     String             @db.ObjectId
+  content      String
+  nonce        String
+  contentType  MessageContentType @default(TEXT)
+  replyToId    String?            @db.ObjectId
+  isEdited     Boolean            @default(false)
+  isDeleted    Boolean            @default(false)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  matchGroup   MatchGroup         @relation(fields: [matchGroupId], references: [id], onDelete: Cascade)
+  sender       User               @relation(fields: [senderId], references: [id])
+  replyTo      GroupMessage?      @relation("GroupReplies", fields: [replyToId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  replies      GroupMessage[]     @relation("GroupReplies")
+  readReceipts GroupMessageRead[]
+
+  @@index([matchGroupId, createdAt])
+  @@map("group_messages")
+}
+
+model GroupMessageRead {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  messageId String   @db.ObjectId
+  userId    String   @db.ObjectId
+  readAt    DateTime @default(now())
+
+  message GroupMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId])
+  @@index([userId])
+  @@map("group_message_reads")
+}
+
+model MatchGroupMember {
+  id           String @id @default(auto()) @map("_id") @db.ObjectId
+  matchGroupId String @db.ObjectId
+  userId       String @db.ObjectId
+  doubtId      String? @db.ObjectId
+  role         String // "helper" or "learner"
+
+  matchGroup MatchGroup @relation(fields: [matchGroupId], references: [id], onDelete: Cascade)
+
+  @@unique([matchGroupId, userId])
+  @@map("match_group_members")
+}
