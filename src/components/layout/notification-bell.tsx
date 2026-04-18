@@ -3,12 +3,15 @@
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNotifications } from "@/providers/notification-provider";
+import { useNotificationAction } from "@/providers/notification-action-provider";
 import { cn, formatRelativeTime } from "@/lib/utils";
+import type { NotificationItem } from "@/types";
 
 export function NotificationBell() {
   const router = useRouter();
   const { notifications, unreadCount, inboxError, markAsRead, refresh } =
     useNotifications();
+  const { openDialog } = useNotificationAction();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -27,14 +30,16 @@ export function NotificationBell() {
     void refresh();
   }, [refresh]);
 
-  const handleItemClick = async (id: string, linkUrl: string | null, isRead: boolean) => {
-    if (!isRead) {
-      await markAsRead([id]);
-    }
+  const handleItemClick = (notif: NotificationItem) => {
+    if (!notif.isRead) void markAsRead([notif.id]);
     setOpen(false);
-    if (linkUrl) {
-      router.push(linkUrl);
+
+    if (notif.type === "MATCH_PROPOSAL" || notif.type === "MUTUAL_MATCH") {
+      openDialog(notif);
+      return;
     }
+
+    if (notif.linkUrl) router.push(notif.linkUrl);
   };
 
   return (
@@ -91,7 +96,7 @@ export function NotificationBell() {
                   <li key={n.id}>
                     <button
                       type="button"
-                      onClick={() => void handleItemClick(n.id, n.linkUrl ?? null, n.isRead)}
+                      onClick={() => handleItemClick(n)}
                       className={cn(
                         "w-full text-left px-4 py-3 border-b border-border/60 last:border-0 hover:bg-muted/60 transition-colors",
                         !n.isRead && "bg-primary/[0.06]"

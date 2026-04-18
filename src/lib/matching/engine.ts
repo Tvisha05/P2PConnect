@@ -455,6 +455,7 @@ export async function triggerMatching(options?: {
   if (cycle) {
     // IF cycle found → transaction-safe revalidation + exact row claim.
     const cycleGroup = await prisma.$transaction(async (tx) => {
+
       const candidateRows = await tx.waitingPool.findMany({
         where: { userId: { in: cycle } },
         include: { doubt: { select: { urgency: true } } },
@@ -509,7 +510,7 @@ export async function triggerMatching(options?: {
       });
 
       return group;
-    });
+    }, { timeout: 15000 });
 
     if (!cycleGroup) return;
 
@@ -558,10 +559,56 @@ export async function triggerMatching(options?: {
   const subjects = [...new Set(learnerRows.map((r) => r.subject))];
   const expiresAt = new Date(Date.now() + ONE_WAY_PROPOSAL_EXPIRY_MS);
 
-  const createdProposal = await prisma.$transaction(async (tx) => {
-    const rowIds = learnerRows.map((r) => r.id);
+  // ── Safety reads run OUTSIDE the transaction to keep it short ──────────
+  const rowIds = learnerRows.map((r) => r.id);
+  const canonicalMembers = [helperId, ...learnerIds.slice().sort()];
+  const canonicalDoubtIds = doubtIds.slice().sort();
 
-    // Safety: learners must still be in the exact rows this run selected.
+  const [preBusy, existingPending, recentRejected] = await Promise.all([
+    findBusyUserIds(prisma, allMembers),
+    prisma.matchProposal.findMany({
+      where: { type: "one_way", status: "PENDING", helperId, expiresAt: { gt: new Date() } },
+      select: { members: true, doubtIds: true },
+    }),
+    prisma.matchProposal.findMany({
+      where: {
+        type: "one_way",
+        status: "REJECTED",
+        helperId,
+        updatedAt: { gt: new Date(Date.now() - REJECT_COOLDOWN_MS) },
+      },
+      select: { members: true, doubtIds: true },
+    }),
+  ]);
+
+  if (allMembers.some((id) => preBusy.has(id))) return;
+
+  const hasMatchingPending = existingPending.some((p) => {
+    const em = p.members.slice().sort();
+    const ed = p.doubtIds.slice().sort();
+    return (
+      em.length === canonicalMembers.length &&
+      em.every((m, i) => m === canonicalMembers[i]) &&
+      ed.length === canonicalDoubtIds.length &&
+      ed.every((d, i) => d === canonicalDoubtIds[i])
+    );
+  });
+  if (hasMatchingPending) return;
+
+  const hasRecentRejectedTwin = recentRejected.some((p) => {
+    const rm = p.members.slice().sort();
+    const rd = p.doubtIds.slice().sort();
+    return (
+      rm.length === canonicalMembers.length &&
+      rm.every((m, i) => m === canonicalMembers[i]) &&
+      rd.length === canonicalDoubtIds.length &&
+      rd.every((d, i) => d === canonicalDoubtIds[i])
+    );
+  });
+  if (hasRecentRejectedTwin) return;
+
+  // ── Minimal transaction: verify rows still exist, then create ───────────
+  const createdProposal = await prisma.$transaction(async (tx) => {
     const currentRows = await tx.waitingPool.findMany({
       where: { id: { in: rowIds } },
       select: { id: true, userId: true },
@@ -570,58 +617,9 @@ export async function triggerMatching(options?: {
     const rowUserIds = new Set(currentRows.map((r) => r.userId));
     if (!learnerIds.every((id) => rowUserIds.has(id))) return null;
 
-    // Safety: helper/learners cannot be reused if already busy.
+    // Final busy check inside transaction for atomicity.
     const busy = await findBusyUserIds(tx, allMembers);
     if (allMembers.some((id) => busy.has(id))) return null;
-
-    const canonicalMembers = [helperId, ...learnerIds.slice().sort()];
-    const canonicalDoubtIds = doubtIds.slice().sort();
-
-    // Safety: prevent duplicate pending proposals for same helper/learners/doubts.
-    const existingPending = await tx.matchProposal.findMany({
-      where: {
-        type: "one_way",
-        status: "PENDING",
-        helperId,
-        expiresAt: { gt: new Date() },
-      },
-      select: { members: true, doubtIds: true },
-    });
-    const hasMatchingPending = existingPending.some((p) => {
-      const existingMembers = p.members.slice().sort();
-      const existingDoubtIds = p.doubtIds.slice().sort();
-      const sameMembers =
-        existingMembers.length === canonicalMembers.length &&
-        existingMembers.every((m, i) => m === canonicalMembers[i]);
-      const sameDoubts =
-        existingDoubtIds.length === canonicalDoubtIds.length &&
-        existingDoubtIds.every((d, i) => d === canonicalDoubtIds[i]);
-      return sameMembers && sameDoubts;
-    });
-    if (hasMatchingPending) return null;
-
-    // Safety: after reject, wait briefly before recreating exact same proposal.
-    const recentRejected = await tx.matchProposal.findMany({
-      where: {
-        type: "one_way",
-        status: "REJECTED",
-        helperId,
-        updatedAt: { gt: new Date(Date.now() - REJECT_COOLDOWN_MS) },
-      },
-      select: { members: true, doubtIds: true },
-    });
-    const hasRecentRejectedTwin = recentRejected.some((p) => {
-      const rejectedMembers = p.members.slice().sort();
-      const rejectedDoubtIds = p.doubtIds.slice().sort();
-      const sameMembers =
-        rejectedMembers.length === canonicalMembers.length &&
-        rejectedMembers.every((m, i) => m === canonicalMembers[i]);
-      const sameDoubts =
-        rejectedDoubtIds.length === canonicalDoubtIds.length &&
-        rejectedDoubtIds.every((d, i) => d === canonicalDoubtIds[i]);
-      return sameMembers && sameDoubts;
-    });
-    if (hasRecentRejectedTwin) return null;
 
     return tx.matchProposal.create({
       data: {
@@ -634,7 +632,7 @@ export async function triggerMatching(options?: {
         expiresAt,
       },
     });
-  });
+  }, { timeout: 15000 });
 
   if (!createdProposal) return;
 

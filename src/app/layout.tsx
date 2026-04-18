@@ -3,8 +3,10 @@ import { Fraunces, Plus_Jakarta_Sans, Geist_Mono } from "next/font/google";
 import { AuthProvider } from "@/providers/auth-provider";
 import { ThemeProvider } from "@/providers/theme-provider";
 import { NotificationProvider } from "@/providers/notification-provider";
+import { NotificationActionProvider } from "@/providers/notification-action-provider";
 import { MatchProposalAlerts } from "@/components/matching/match-proposal-alerts";
 import { MutualMatchNotificationsAlert } from "@/components/matching/mutual-match-notifications-alert";
+import { Toaster } from "sonner";
 import "./globals.css";
 
 const fraunces = Fraunces({
@@ -42,9 +44,16 @@ export default function RootLayout({
         <AuthProvider>
           <ThemeProvider>
             <NotificationProvider>
-              <MatchProposalAlerts />
-              <MutualMatchNotificationsAlert />
-              {children}
+              <NotificationActionProvider>
+                <MatchProposalAlerts />
+                <MutualMatchNotificationsAlert />
+                <Toaster
+                  position="top-right"
+                  theme="system"
+                  toastOptions={{ unstyled: true, classNames: { toast: "" } }}
+                />
+                {children}
+              </NotificationActionProvider>
             </NotificationProvider>
           </ThemeProvider>
         </AuthProvider>

@@ -6,6 +6,7 @@ import { createDoubtSchema } from "@/lib/validators";
 import { Prisma } from "@/generated/prisma";
 import { triggerMatching } from "@/lib/matching/engine";
 import { POOL_MIN_WAIT_BEFORE_MATCH_MS } from "@/lib/matching/constants";
+import { notifyHelpersOfNewDoubt } from "@/lib/notifications";
 
 const doubtInclude = {
   seeker: { select: { id: true, name: true, image: true } },
@@ -173,6 +174,14 @@ export async function POST(req: NextRequest) {
     },
     include: doubtInclude,
   });
+
+  // Notify helpers whose strong subjects match this doubt's subject.
+  void notifyHelpersOfNewDoubt({
+    doubtId: doubt.id,
+    subject: doubt.subject,
+    title: doubt.title,
+    seekerId: session.user.id,
+  }).catch((err) => console.error("Helper new-doubt notification error:", err));
 
   // Auto-add to waiting pool + run matching (await first pass so DB + notifications finish
   // before the response; delayed pass catches the 30s pool window).
