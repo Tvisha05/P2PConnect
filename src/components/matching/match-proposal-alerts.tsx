@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useSession } from "next-auth/react";
 import { toast } from "sonner";
+import { onValue, ref as rtdbRef } from "firebase/database";
+import { realtimeDb } from "@/lib/firebase";
 import { useNotifications } from "@/providers/notification-provider";
 import { ProposalActionToast } from "@/components/matching/proposal-action-toast";
 
-const POLL_MS = 800;
+const FALLBACK_POLL_MS = 30_000;
 
 type MemberDetail = {
   id: string;
@@ -79,6 +81,15 @@ export function MatchProposalAlerts() {
       if (!res.ok) return;
       const data = await res.json();
       const list: ApiProposal[] = data.proposals ?? [];
+      const currentIds = new Set(list.map((p) => p.id));
+
+      // Dismiss toasts for proposals that are no longer pending
+      for (const id of alertedIdsRef.current) {
+        if (!currentIds.has(id)) {
+          toast.dismiss(`proposal-${id}`);
+          alertedIdsRef.current.delete(id);
+        }
+      }
 
       let hasNew = false;
       for (const p of list) {
@@ -97,18 +108,27 @@ export function MatchProposalAlerts() {
   }, [session?.user?.id, status, showProposalToast, refreshNotifications]);
 
   useEffect(() => {
-    if (status !== "authenticated") return;
-    void poll();
-    const id = window.setInterval(poll, POLL_MS);
+    if (status !== "authenticated" || !session?.user?.id) return;
+    const userId = session.user.id;
+
+    // Real-time: Firebase fires instantly when a proposal is created for this user
+    const signalRef = rtdbRef(realtimeDb, `users/${userId}/signals/proposal`);
+    const unsubSignal = onValue(signalRef, () => void poll());
+
+    // Slow fallback in case Firebase is unavailable
+    const interval = window.setInterval(() => void poll(), FALLBACK_POLL_MS);
+
     const onVisible = () => {
       if (document.visibilityState === "visible") void poll();
     };
     document.addEventListener("visibilitychange", onVisible);
+
     return () => {
-      window.clearInterval(id);
+      unsubSignal();
+      window.clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [poll, status]);
+  }, [poll, status, session?.user?.id]);
 
   return null;
 }

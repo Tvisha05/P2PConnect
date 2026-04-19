@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useSession } from "next-auth/react";
 import { toast } from "sonner";
+import { onValue, ref as rtdbRef } from "firebase/database";
+import { realtimeDb } from "@/lib/firebase";
 import { useNotifications } from "@/providers/notification-provider";
 import { MutualMatchToast } from "@/components/matching/mutual-match-toast";
 
-const POLL_MS = 1_500;
+const FALLBACK_POLL_MS = 30_000;
 
 type NotifRow = {
   id: string;
@@ -88,11 +90,21 @@ export function MutualMatchNotificationsAlert() {
   }, [session?.user?.id, status, showMutualToast, refreshNotifications]);
 
   useEffect(() => {
-    if (status !== "authenticated") return;
-    void poll();
-    const id = window.setInterval(poll, POLL_MS);
-    return () => window.clearInterval(id);
-  }, [poll, status]);
+    if (status !== "authenticated" || !session?.user?.id) return;
+    const userId = session.user.id;
+
+    // Real-time: Firebase fires instantly when a notification arrives
+    const signalRef = rtdbRef(realtimeDb, `users/${userId}/signals/notification`);
+    const unsubSignal = onValue(signalRef, () => void poll());
+
+    // Slow fallback in case Firebase is unavailable
+    const interval = window.setInterval(() => void poll(), FALLBACK_POLL_MS);
+
+    return () => {
+      unsubSignal();
+      window.clearInterval(interval);
+    };
+  }, [poll, status, session?.user?.id]);
 
   return null;
 }

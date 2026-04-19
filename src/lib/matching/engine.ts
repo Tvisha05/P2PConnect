@@ -19,8 +19,11 @@ const MIN_GROUP_SIZE = 2;
  * 2+ pool rows, so solo learners never matched and helpers never got proposals.
  */
 const MIN_POOL_ROWS_TO_RUN = 1;
-const ONE_WAY_PROPOSAL_EXPIRY_MS = 25_000;
+const ONE_WAY_PROPOSAL_EXPIRY_MS = 300_000; // 5 minutes
 const REJECT_COOLDOWN_MS = 35_000;
+const EXPIRE_COOLDOWN_MS = 300_000; // skip a helper for 5 min after their proposal expires
+/** Max helpers notified simultaneously; first to accept wins. */
+const MAX_BROADCAST_PROPOSALS = 10;
 /** Cap total time spent in cycle DFS per `tryCycleGroups` call (worst-case guard). */
 const MAX_DFS_TIME_MS = 200;
 
@@ -317,14 +320,14 @@ function tryCycleGroups(
 // ─── One-Way Helper Groups ──────────────────────────────
 
 /**
- * Find a one-way helper group: one helper who can help multiple learners.
- * Returns { helperId, learnerIds } or null.
+ * Rank all potential one-way helper groups by descending learner count.
+ * The caller iterates through candidates to skip helpers who recently
+ * expired or rejected, so we return the full sorted list.
  */
 function tryOneWayGroup(
   graph: Graph,
   poolUserIds: Set<string>
-): { helperId: string; learnerIds: string[] } | null {
-  // Try helpers with the most learners first
+): { helperId: string; learnerIds: string[] }[] {
   const candidates: { helperId: string; learnerIds: string[] }[] = [];
 
   for (const [helperId, neighbors] of graph) {
@@ -334,10 +337,8 @@ function tryOneWayGroup(
     }
   }
 
-  // Sort by number of learners (descending) — prefer larger groups
   candidates.sort((a, b) => b.learnerIds.length - a.learnerIds.length);
-
-  return candidates[0] || null;
+  return candidates;
 }
 
 function resolveOneWayLearnerRows(
@@ -432,7 +433,7 @@ export async function triggerMatching(options?: {
   const availablePool = pool.filter((p) => !pendingUserIds.has(p.userId));
   if (availablePool.length < MIN_POOL_ROWS_TO_RUN) return;
 
-  const CYCLE_ONLY_WINDOW_MS = 30000;
+  const CYCLE_ONLY_WINDOW_MS = 11_000;
   const now = Date.now();
   const oldestJoinTime = Math.min(
     ...availablePool.map((p) => p.joinedAt.getTime())
@@ -539,111 +540,123 @@ export async function triggerMatching(options?: {
     includeExternalHelpers: true,
   });
 
-  const oneWay = tryOneWayGroup(extendedGraph, poolUserIdsFull);
-  if (!oneWay) return;
+  const candidates = tryOneWayGroup(extendedGraph, poolUserIdsFull);
+  if (candidates.length === 0) return;
 
-  const { helperId } = oneWay;
-  const limitedLearners = oneWay.learnerIds.slice(0, MAX_GROUP_SIZE - 1);
-  const oneWayRows = resolveOneWayLearnerRows(
-    helperId,
-    limitedLearners,
-    sortedPool,
-    extendedStrongByUser
-  );
-  if (!oneWayRows) return;
+  // Broadcast to ALL eligible helpers simultaneously — first to accept wins.
+  // Learners may appear in multiple concurrent proposals; only the helper's
+  // availability is checked here.
+  let broadcastCount = 0;
 
-  const learnerRows = oneWayRows.learnerRows;
-  const learnerIds = learnerRows.map((r) => r.userId);
-  const allMembers = [helperId, ...learnerIds];
-  const doubtIds = learnerRows.map((r) => r.doubtId);
-  const subjects = [...new Set(learnerRows.map((r) => r.subject))];
-  const expiresAt = new Date(Date.now() + ONE_WAY_PROPOSAL_EXPIRY_MS);
+  for (const candidate of candidates) {
+    if (broadcastCount >= MAX_BROADCAST_PROPOSALS) break;
 
-  // ── Safety reads run OUTSIDE the transaction to keep it short ──────────
-  const rowIds = learnerRows.map((r) => r.id);
-  const canonicalMembers = [helperId, ...learnerIds.slice().sort()];
-  const canonicalDoubtIds = doubtIds.slice().sort();
-
-  const [preBusy, existingPending, recentRejected] = await Promise.all([
-    findBusyUserIds(prisma, allMembers),
-    prisma.matchProposal.findMany({
-      where: { type: "one_way", status: "PENDING", helperId, expiresAt: { gt: new Date() } },
-      select: { members: true, doubtIds: true },
-    }),
-    prisma.matchProposal.findMany({
-      where: {
-        type: "one_way",
-        status: "REJECTED",
-        helperId,
-        updatedAt: { gt: new Date(Date.now() - REJECT_COOLDOWN_MS) },
-      },
-      select: { members: true, doubtIds: true },
-    }),
-  ]);
-
-  if (allMembers.some((id) => preBusy.has(id))) return;
-
-  const hasMatchingPending = existingPending.some((p) => {
-    const em = p.members.slice().sort();
-    const ed = p.doubtIds.slice().sort();
-    return (
-      em.length === canonicalMembers.length &&
-      em.every((m, i) => m === canonicalMembers[i]) &&
-      ed.length === canonicalDoubtIds.length &&
-      ed.every((d, i) => d === canonicalDoubtIds[i])
+    const helperId = candidate.helperId;
+    const limitedLearners = candidate.learnerIds.slice(0, MAX_GROUP_SIZE - 1);
+    const oneWayRows = resolveOneWayLearnerRows(
+      helperId,
+      limitedLearners,
+      sortedPool,
+      extendedStrongByUser
     );
-  });
-  if (hasMatchingPending) return;
+    if (!oneWayRows) continue;
 
-  const hasRecentRejectedTwin = recentRejected.some((p) => {
-    const rm = p.members.slice().sort();
-    const rd = p.doubtIds.slice().sort();
-    return (
-      rm.length === canonicalMembers.length &&
-      rm.every((m, i) => m === canonicalMembers[i]) &&
-      rd.length === canonicalDoubtIds.length &&
-      rd.every((d, i) => d === canonicalDoubtIds[i])
-    );
-  });
-  if (hasRecentRejectedTwin) return;
+    const learnerRows = oneWayRows.learnerRows;
+    const learnerIds = learnerRows.map((r) => r.userId);
+    const doubtIds = learnerRows.map((r) => r.doubtId);
+    const subjects = [...new Set(learnerRows.map((r) => r.subject))];
+    const rowIds = learnerRows.map((r) => r.id);
+    const canonicalMembers = [helperId, ...learnerIds.slice().sort()];
+    const canonicalDoubtIds = doubtIds.slice().sort();
 
-  // ── Minimal transaction: verify rows still exist, then create ───────────
-  const createdProposal = await prisma.$transaction(async (tx) => {
-    const currentRows = await tx.waitingPool.findMany({
-      where: { id: { in: rowIds } },
-      select: { id: true, userId: true },
+    // Only check if THIS HELPER is already committed elsewhere; learners can
+    // hold concurrent proposals from multiple helpers.
+    const [helperBusy, existingPending, recentRejected, recentExpired] = await Promise.all([
+      findBusyUserIds(prisma, [helperId]),
+      prisma.matchProposal.findMany({
+        where: { type: "one_way", status: "PENDING", helperId, expiresAt: { gt: new Date() } },
+        select: { members: true, doubtIds: true },
+      }),
+      prisma.matchProposal.findMany({
+        where: {
+          type: "one_way",
+          status: "REJECTED",
+          helperId,
+          updatedAt: { gt: new Date(Date.now() - REJECT_COOLDOWN_MS) },
+        },
+        select: { members: true, doubtIds: true },
+      }),
+      prisma.matchProposal.findMany({
+        where: {
+          type: "one_way",
+          status: "EXPIRED",
+          helperId,
+          updatedAt: { gt: new Date(Date.now() - EXPIRE_COOLDOWN_MS) },
+        },
+        select: { members: true, doubtIds: true },
+      }),
+    ]);
+
+    if (helperBusy.has(helperId)) continue;
+
+    const isSamePair = (p: { members: string[]; doubtIds: string[] }) => {
+      const em = p.members.slice().sort();
+      const ed = p.doubtIds.slice().sort();
+      return (
+        em.length === canonicalMembers.length &&
+        em.every((m, i) => m === canonicalMembers[i]) &&
+        ed.length === canonicalDoubtIds.length &&
+        ed.every((d, i) => d === canonicalDoubtIds[i])
+      );
+    };
+
+    if (existingPending.some(isSamePair)) continue;
+    if (recentRejected.some(isSamePair)) continue;
+    if (recentExpired.some(isSamePair)) continue;
+
+    // ── Minimal transaction: verify rows still exist, then create ──────────
+    const allMembers = [helperId, ...learnerIds];
+    const expiresAt = new Date(Date.now() + ONE_WAY_PROPOSAL_EXPIRY_MS);
+    const createdProposal = await prisma.$transaction(async (tx) => {
+      const currentRows = await tx.waitingPool.findMany({
+        where: { id: { in: rowIds } },
+        select: { id: true, userId: true },
+      });
+      if (currentRows.length !== rowIds.length) return null;
+      const rowUserIds = new Set(currentRows.map((r) => r.userId));
+      if (!learnerIds.every((id) => rowUserIds.has(id))) return null;
+
+      // Only block if this helper is busy; learners may have concurrent proposals.
+      const busy = await findBusyUserIds(tx, [helperId]);
+      if (busy.has(helperId)) return null;
+
+      return tx.matchProposal.create({
+        data: {
+          type: "one_way",
+          status: "PENDING",
+          members: allMembers,
+          doubtIds,
+          subjects,
+          helperId,
+          expiresAt,
+        },
+      });
+    }, { timeout: 15000 });
+
+    if (!createdProposal) continue;
+
+    void notifyHelperNewMatchProposal({
+      proposalId: createdProposal.id,
+      helperId,
+      subjects,
+      learnerIds,
+    }).catch((err) => {
+      console.error("Match proposal notification error:", err);
     });
-    if (currentRows.length !== rowIds.length) return null;
-    const rowUserIds = new Set(currentRows.map((r) => r.userId));
-    if (!learnerIds.every((id) => rowUserIds.has(id))) return null;
 
-    // Final busy check inside transaction for atomicity.
-    const busy = await findBusyUserIds(tx, allMembers);
-    if (allMembers.some((id) => busy.has(id))) return null;
-
-    return tx.matchProposal.create({
-      data: {
-        type: "one_way",
-        status: "PENDING",
-        members: allMembers,
-        doubtIds,
-        subjects,
-        helperId,
-        expiresAt,
-      },
-    });
-  }, { timeout: 15000 });
-
-  if (!createdProposal) return;
-
-  void notifyHelperNewMatchProposal({
-    proposalId: createdProposal.id,
-    helperId,
-    subjects,
-    learnerIds,
-  }).catch((err) => {
-    console.error("Match proposal notification error:", err);
-  });
+    broadcastCount++;
+    // Continue loop — notify ALL eligible helpers, not just the first.
+  }
 }
 
 // ─── Proposal Actions ───────────────────────────────────
@@ -691,6 +704,17 @@ export async function acceptProposal(proposalId: string, helperId: string) {
       throw new Error("Proposal not found or already handled");
     }
 
+    // First-accept wins: cancel every other pending proposal for these learner doubts
+    // so competing helpers know the spot is taken.
+    await tx.matchProposal.updateMany({
+      where: {
+        id: { not: proposalId },
+        status: "PENDING",
+        doubtIds: { hasSome: proposal.doubtIds },
+      },
+      data: { status: "EXPIRED" },
+    });
+
     // Create the match group
     const learnerIds = proposal.members.filter((id) => id !== helperId);
     const created = await tx.matchGroup.create({
@@ -723,7 +747,7 @@ export async function acceptProposal(proposalId: string, helperId: string) {
     .filter((m) => m.role === "learner")
     .map((m) => m.userId);
 
-  void notifyLearnersOfOneWayMatch({
+  await notifyLearnersOfOneWayMatch({
     groupId: group.id,
     helperId,
     learnerIds,

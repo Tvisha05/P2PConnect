@@ -11,19 +11,12 @@ export async function GET() {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Expire old proposals
-    await prisma.matchProposal.updateMany({
-      where: {
-        status: "PENDING",
-        expiresAt: { lt: new Date() },
-      },
-      data: { status: "EXPIRED" },
-    });
-
+    const now = new Date();
     const proposals = await prisma.matchProposal.findMany({
       where: {
         helperId: session.user.id,
         status: "PENDING",
+        expiresAt: { gt: now },
       },
       orderBy: { createdAt: "desc" },
     });

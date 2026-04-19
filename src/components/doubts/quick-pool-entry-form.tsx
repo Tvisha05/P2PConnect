@@ -174,15 +174,11 @@ export function QuickPoolEntryForm({ defaultCategoryId }: Props) {
       // In practice, background timers can be unreliable in some local/dev
       // setups. Fire a delayed trigger from the active client as a safety net.
       window.setTimeout(() => {
-        void fetch("/api/matching/trigger", { method: "POST" }).catch(() => {
-          // Best-effort safety trigger
-        });
-      }, 32_000);
+        void fetch("/api/matching/trigger", { method: "POST" }).catch(() => {});
+      }, 12_000);
       window.setTimeout(() => {
-        void fetch("/api/matching/trigger", { method: "POST" }).catch(() => {
-          // Best-effort safety trigger
-        });
-      }, 42_000);
+        void fetch("/api/matching/trigger", { method: "POST" }).catch(() => {});
+      }, 15_000);
 
       setAdded(true);
       setSubject("");

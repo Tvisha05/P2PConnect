@@ -1,10 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { toast } from "sonner";
 import { useNotifications } from "@/providers/notification-provider";
+import { onValue, ref as rtdbRef } from "firebase/database";
+import { realtimeDb } from "@/lib/firebase";
 
 type Proposal = {
   id: string;
@@ -13,66 +15,54 @@ type Proposal = {
   memberDetails: { id: string; name: string | null; isHelper: boolean }[];
 };
 
-type MutualNotif = {
-  id: string;
-  title: string;
-  body: string;
-  linkUrl: string | null;
-};
-
 export function DoubtProposalActions({ doubtId }: { doubtId: string }) {
-  const { status } = useSession();
+  const { data: session, status } = useSession();
   const router = useRouter();
-  const { markAsRead, refresh } = useNotifications();
+  const { notifications, markAsRead, refresh } = useNotifications();
   const [proposal, setProposal] = useState<Proposal | null>(null);
-  const [mutual, setMutual] = useState<MutualNotif | null>(null);
   const [acting, setActing] = useState(false);
+  const actingRef = useRef(false);
+
+  // Derive mutual match from the already-polled notification context (no extra fetch).
+  const mutual = notifications.find(
+    (n) => n.type === "MUTUAL_MATCH" && !n.isRead
+  ) ?? null;
+
+  const load = useCallback(async () => {
+    if (actingRef.current) return;
+    try {
+      const res = await fetch("/api/matching/proposals", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = await res.json();
+      const match: Proposal | undefined = (data.proposals ?? []).find(
+        (p: Proposal) => p.doubtIds.includes(doubtId)
+      );
+      setProposal(match ?? null);
+    } catch {
+      // ignore
+    }
+  }, [doubtId]);
 
   useEffect(() => {
-    if (status !== "authenticated") return;
+    if (status !== "authenticated" || !session?.user?.id) return;
+    const userId = session.user.id;
 
-    async function load() {
-      try {
-        const [propRes, notifRes] = await Promise.all([
-          fetch("/api/matching/proposals", { cache: "no-store" }),
-          fetch("/api/notifications?limit=30", {
-            credentials: "same-origin",
-            cache: "no-store",
-          }),
-        ]);
+    // Real-time via Firebase
+    const signalRef = rtdbRef(realtimeDb, `users/${userId}/signals/proposal`);
+    const unsubSignal = onValue(signalRef, () => void load());
 
-        if (propRes.ok) {
-          const data = await propRes.json();
-          const match: Proposal | undefined = (data.proposals ?? []).find(
-            (p: Proposal) => p.doubtIds.includes(doubtId)
-          );
-          setProposal(match ?? null);
-        }
+    // Slow fallback
+    const id = window.setInterval(() => void load(), 30_000);
 
-        if (notifRes.ok) {
-          const data = await notifRes.json();
-          const matchNotif = (
-            data.items as {
-              type: string;
-              isRead: boolean;
-              linkUrl: string | null;
-              id: string;
-              title: string;
-              body: string;
-            }[]
-          ).find((n) => n.type === "MUTUAL_MATCH" && !n.isRead);
-          setMutual(matchNotif ?? null);
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    void load();
-  }, [status, doubtId]);
+    return () => {
+      unsubSignal();
+      window.clearInterval(id);
+    };
+  }, [status, session?.user?.id, load]);
 
   const acceptProposal = async () => {
     if (!proposal) return;
+    actingRef.current = true;
     setActing(true);
     try {
       const res = await fetch(`/api/matching/proposals/${proposal.id}/accept`, {
@@ -81,6 +71,7 @@ export function DoubtProposalActions({ doubtId }: { doubtId: string }) {
       const j = await res.json().catch(() => ({}));
       if (!res.ok) {
         toast.error(typeof j.error === "string" ? j.error : "Could not accept.");
+        actingRef.current = false;
         setActing(false);
         return;
       }
@@ -90,12 +81,14 @@ export function DoubtProposalActions({ doubtId }: { doubtId: string }) {
       if (j.group?.id) router.push(`/groups/${j.group.id}`);
     } catch {
       toast.error("Network error. Please try again.");
+      actingRef.current = false;
       setActing(false);
     }
   };
 
   const declineProposal = async () => {
     if (!proposal) return;
+    actingRef.current = true;
     setActing(true);
     try {
       await fetch(`/api/matching/proposals/${proposal.id}/reject`, {
@@ -107,6 +100,7 @@ export function DoubtProposalActions({ doubtId }: { doubtId: string }) {
     toast.success("Proposal declined.");
     void refresh();
     setProposal(null);
+    actingRef.current = false;
     setActing(false);
   };
 

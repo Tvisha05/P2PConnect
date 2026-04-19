@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import type { NotificationType } from "@/generated/prisma";
+import { pushProposalSignal, pushNotificationSignal } from "@/lib/realtime";
 
 type CreateNotificationInput = {
   recipientId: string;
@@ -59,6 +60,7 @@ export async function notifyHelperNewMatchProposal(params: {
     linkUrl: `/doubts/new?focusProposal=${proposalId}`,
     dedupeKey: `proposal:${proposalId}`,
   });
+  await pushProposalSignal(helperId, proposalId).catch(() => {});
 }
 
 export async function notifyLearnersOfOneWayMatch(params: {
@@ -90,6 +92,7 @@ export async function notifyLearnersOfOneWayMatch(params: {
       })
     )
   );
+  void Promise.all(learnerIds.map((id) => pushNotificationSignal(id))).catch(() => {});
 }
 
 export async function notifyHelpersOfNewDoubt(params: {
@@ -136,6 +139,7 @@ export async function notifyHelpersOfNewDoubt(params: {
       linkUrl: `/doubts/${doubtId}`,
     })),
   });
+  void Promise.all(toNotify.map(({ userId }) => pushNotificationSignal(userId))).catch(() => {});
 }
 
 export async function notifyMembersOfMutualGroup(params: {
@@ -169,4 +173,5 @@ export async function notifyMembersOfMutualGroup(params: {
       });
     })
   );
+  void Promise.all(memberUserIds.map((id) => pushNotificationSignal(id))).catch(() => {});
 }
