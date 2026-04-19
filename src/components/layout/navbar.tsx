@@ -11,6 +11,8 @@ import { cn } from "@/lib/utils";
 const navLinks = [
   { href: "/feed", label: "Feed" },
   { href: "/tags", label: "Tags" },
+  { href: "/activity", label: "Activity" },
+  { href: "/groups", label: "My Groups" },
 ];
 
 export function Navbar() {
@@ -124,9 +126,6 @@ export function Navbar() {
                       </p>
                     </div>
                     <div className="py-1">
-                      <DropdownLink href="/groups">My Groups</DropdownLink>
-                      <DropdownLink href="/activity">My Activity</DropdownLink>
-                      <DropdownLink href="/bookmarks">Bookmarks</DropdownLink>
                       <DropdownLink href="/settings">Settings</DropdownLink>
                     </div>
                     <div className="border-t border-border pt-1">

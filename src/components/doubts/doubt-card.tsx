@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { StatusBadge, UrgencyBadge, Badge } from "@/components/ui/badge";
+import { StatusBadge, UrgencyBadge } from "@/components/ui/badge";
 import { formatRelativeTime, truncate } from "@/lib/utils";
 import type { DoubtWithRelations } from "@/types";
 
@@ -13,7 +13,6 @@ export function DoubtCard({ doubt }: { doubt: DoubtWithRelations }) {
       <div className="flex items-center gap-2 flex-wrap mb-3">
         <StatusBadge status={doubt.status} />
         <UrgencyBadge urgency={doubt.urgency} />
-        <Badge variant="outline">{doubt.category.name}</Badge>
       </div>
 
       {/* Title */}

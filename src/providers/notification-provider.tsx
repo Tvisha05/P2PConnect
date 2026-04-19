@@ -3,6 +3,8 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef } from "react";
 import { useSession } from "next-auth/react";
 import type { NotificationItem } from "@/types";
+import { onValue, ref as rtdbRef } from "firebase/database";
+import { realtimeDb } from "@/lib/firebase";
 
 type NotificationContextType = {
   notifications: NotificationItem[];
@@ -100,6 +102,12 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     poll();
     const interval = setInterval(poll, 15_000);
 
+    // Real-time: re-fetch immediately when Firebase signals a new notification
+    const signalRef = rtdbRef(realtimeDb, `users/${userId}/signals/notification`);
+    const unsubSignal = onValue(signalRef, () => {
+      if (active) void fetchNotifications();
+    });
+
     const onVisible = () => {
       if (document.visibilityState === "visible") void fetchNotifications();
     };
@@ -108,6 +116,7 @@ export function NotificationProvider({ children }: { children: React.ReactNode }
     return () => {
       active = false;
       clearInterval(interval);
+      unsubSignal();
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [status, userId, fetchNotifications]);

@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import type { NotificationType } from "@/generated/prisma";
+import { pushProposalSignal, pushNotificationSignal } from "@/lib/realtime";
 
 type CreateNotificationInput = {
   recipientId: string;
@@ -8,16 +9,9 @@ type CreateNotificationInput = {
   body: string;
   linkUrl?: string | null;
   senderId?: string | null;
-  /**
-   * Best-effort idempotency key. If provided, we avoid creating a duplicate
-   * notification with the same recipient+type+link within this key scope.
-   */
   dedupeKey?: string;
 };
 
-/**
- * Persist an in-app notification (server-only).
- */
 export async function createNotification(input: CreateNotificationInput) {
   if (input.dedupeKey) {
     const existing = await prisma.notification.findFirst({
@@ -43,9 +37,6 @@ export async function createNotification(input: CreateNotificationInput) {
   });
 }
 
-/**
- * Notify the helper as soon as a one-way match proposal is created.
- */
 export async function notifyHelperNewMatchProposal(params: {
   proposalId: string;
   helperId: string;
@@ -59,8 +50,7 @@ export async function notifyHelperNewMatchProposal(params: {
     select: { name: true },
   });
   const names = learners.map((u) => u.name ?? "A peer").join(", ");
-  const topicLine =
-    subjects.length > 0 ? subjects.join(", ") : "peer learning";
+  const topicLine = subjects.length > 0 ? subjects.join(", ") : "peer learning";
 
   await createNotification({
     recipientId: helperId,
@@ -70,11 +60,9 @@ export async function notifyHelperNewMatchProposal(params: {
     linkUrl: `/doubts/new?focusProposal=${proposalId}`,
     dedupeKey: `proposal:${proposalId}`,
   });
+  await pushProposalSignal(helperId, proposalId).catch(() => {});
 }
 
-/**
- * Notify learners when a helper accepts a one-way match proposal.
- */
 export async function notifyLearnersOfOneWayMatch(params: {
   groupId: string;
   helperId: string;
@@ -89,25 +77,71 @@ export async function notifyLearnersOfOneWayMatch(params: {
     select: { name: true },
   });
   const helperName = helper?.name ?? "A peer";
-  const topicLine =
-    subjects.length > 0 ? subjects.join(", ") : "your question";
+  const topicLine = subjects.length > 0 ? subjects.join(", ") : "your question";
 
-  for (const learnerId of learnerIds) {
-    await createNotification({
-      recipientId: learnerId,
-      senderId: helperId,
-      type: "MUTUAL_MATCH",
-      title: "You've been matched!",
-      body: `${helperName} accepted to help you with: ${topicLine}. Open the group to start chatting.`,
-      linkUrl: `/groups/${groupId}`,
-      dedupeKey: `group:${groupId}:learner:${learnerId}`,
-    });
-  }
+  await Promise.all(
+    learnerIds.map((learnerId) =>
+      createNotification({
+        recipientId: learnerId,
+        senderId: helperId,
+        type: "MUTUAL_MATCH",
+        title: "You've been matched!",
+        body: `${helperName} accepted to help you with: ${topicLine}. Open the group to start chatting.`,
+        linkUrl: `/groups/${groupId}`,
+        dedupeKey: `group:${groupId}:learner:${learnerId}`,
+      })
+    )
+  );
+  void Promise.all(learnerIds.map((id) => pushNotificationSignal(id))).catch(() => {});
 }
 
-/**
- * When a mutual (cycle) group is auto-formed, every member gets an in-app notification.
- */
+export async function notifyHelpersOfNewDoubt(params: {
+  doubtId: string;
+  subject: string;
+  title: string;
+  seekerId: string;
+}) {
+  const { doubtId, subject, title, seekerId } = params;
+
+  const helpers = await prisma.academicProfile.findMany({
+    where: {
+      subjectAffinities: {
+        some: { subject: { equals: subject, mode: "insensitive" } },
+      },
+      userId: { not: seekerId },
+    },
+    select: { userId: true },
+  });
+
+  if (helpers.length === 0) return;
+
+  // Skip helpers already notified for this exact doubt.
+  const existingRecipients = await prisma.notification.findMany({
+    where: {
+      type: "TAG_NEW_DOUBT",
+      linkUrl: `/doubts/${doubtId}`,
+      recipientId: { in: helpers.map((h) => h.userId) },
+    },
+    select: { recipientId: true },
+  });
+  const alreadyNotified = new Set(existingRecipients.map((n) => n.recipientId));
+  const toNotify = helpers.filter((h) => !alreadyNotified.has(h.userId));
+
+  if (toNotify.length === 0) return;
+
+  await prisma.notification.createMany({
+    data: toNotify.map(({ userId }) => ({
+      recipientId: userId,
+      senderId: seekerId,
+      type: "TAG_NEW_DOUBT" as NotificationType,
+      title: `New doubt in ${subject}`,
+      body: title,
+      linkUrl: `/doubts/${doubtId}`,
+    })),
+  });
+  void Promise.all(toNotify.map(({ userId }) => pushNotificationSignal(userId))).catch(() => {});
+}
+
 export async function notifyMembersOfMutualGroup(params: {
   groupId: string;
   memberUserIds: string[];
@@ -121,22 +155,23 @@ export async function notifyMembersOfMutualGroup(params: {
     select: { id: true, name: true },
   });
   const nameById = new Map(users.map((u) => [u.id, u.name ?? "Peer"]));
-  const topicLine =
-    subjects.length > 0 ? subjects.join(", ") : "your subjects";
+  const topicLine = subjects.length > 0 ? subjects.join(", ") : "your subjects";
 
-  for (const userId of memberUserIds) {
-    const others = memberUserIds
-      .filter((id) => id !== userId)
-      .map((id) => nameById.get(id) ?? "Peer")
-      .join(", ");
-
-    await createNotification({
-      recipientId: userId,
-      type: "MUTUAL_MATCH",
-      title: "New mutual help group",
-      body: `You’re matched with ${others} for: ${topicLine}. Open the group to coordinate.`,
-      linkUrl: `/groups/${groupId}`,
-      dedupeKey: `group:${groupId}:member:${userId}`,
-    });
-  }
+  await Promise.all(
+    memberUserIds.map((userId) => {
+      const others = memberUserIds
+        .filter((id) => id !== userId)
+        .map((id) => nameById.get(id) ?? "Peer")
+        .join(", ");
+      return createNotification({
+        recipientId: userId,
+        type: "MUTUAL_MATCH",
+        title: "New mutual help group",
+        body: `You're matched with ${others} for: ${topicLine}. Open the group to coordinate.`,
+        linkUrl: `/groups/${groupId}`,
+        dedupeKey: `group:${groupId}:member:${userId}`,
+      });
+    })
+  );
+  void Promise.all(memberUserIds.map((id) => pushNotificationSignal(id))).catch(() => {});
 }

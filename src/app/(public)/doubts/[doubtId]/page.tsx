@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { notFound } from "next/navigation";
 import { DoubtDetail } from "@/components/doubts/doubt-detail";
+import { DoubtProposalActions } from "@/components/doubts/doubt-proposal-actions";
 import Link from "next/link";
 
 export async function generateMetadata({
@@ -61,6 +62,9 @@ export default async function DoubtDetailPage({
           {doubt.title}
         </span>
       </nav>
+
+      {/* Proposal action banner — shown to helpers with a pending invitation */}
+      <DoubtProposalActions doubtId={doubtId} />
 
       {/* Doubt detail card */}
       <div className="rounded-2xl border border-border bg-card p-6 sm:p-8 shadow-sm">

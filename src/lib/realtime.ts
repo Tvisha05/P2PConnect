@@ -20,3 +20,15 @@ export async function pushGroupMessage(
     createdAt: msg.createdAt,
   });
 }
+
+/** Server: poke signal so clients know to re-fetch pending proposals. */
+export async function pushProposalSignal(userId: string, proposalId: string) {
+  const db = getAdminDb();
+  await db.ref(`users/${userId}/signals/proposal`).set({ proposalId, t: Date.now() });
+}
+
+/** Server: poke signal so clients know to re-fetch notifications. */
+export async function pushNotificationSignal(userId: string) {
+  const db = getAdminDb();
+  await db.ref(`users/${userId}/signals/notification`).set({ t: Date.now() });
+}

@@ -113,6 +113,17 @@ export const academicProfileSchema = z.object({
 
 export type AcademicProfileInput = z.infer<typeof academicProfileSchema>;
 
+// ─── Email Preferences ──────────────────────────────────
+
+export const emailPreferencesSchema = z.object({
+  doubtClaimed: z.boolean().optional(),
+  newMessage: z.boolean().optional(),
+  doubtResolved: z.boolean().optional(),
+  tagNewDoubt: z.boolean().optional(),
+  announcements: z.boolean().optional(),
+  weeklyDigest: z.boolean().optional(),
+});
+
 // ─── Reports ────────────────────────────────────────────
 
 export const createReportSchema = z.object({

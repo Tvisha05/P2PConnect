@@ -3,7 +3,6 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { z } from "zod";
-import { Prisma } from "@/generated/prisma";
 
 const storeKeysSchema = z.object({
   keys: z.array(
@@ -130,24 +129,13 @@ export async function POST(
       }
     }
 
-    // First distributor wins for each recipient; later re-seals only fill missing rows.
-    // Overwriting existing rows can rotate the effective group key and break decryption.
+    // First distributor wins — upsert with empty update preserves the original key.
     for (const k of keys) {
-      try {
-        await prisma.groupEncryptedKey.create({
-          data: {
-            matchGroupId: groupId,
-            userId: k.userId,
-            encryptedKey: k.encryptedKey,
-          },
-        });
-      } catch (err) {
-        // Unique row already exists for this member — preserve original key.
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-          continue;
-        }
-        throw err;
-      }
+      await prisma.groupEncryptedKey.upsert({
+        where: { matchGroupId_userId: { matchGroupId: groupId, userId: k.userId } },
+        create: { matchGroupId: groupId, userId: k.userId, encryptedKey: k.encryptedKey },
+        update: {},
+      });
     }
 
     return NextResponse.json({ created: keys.length }, { status: 201 });
